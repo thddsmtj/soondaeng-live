@@ -935,10 +935,23 @@ input:focus, textarea:focus, select:focus {
 
 .notice-comment div {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.comment-delete-button {
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 6px;
+  color: var(--red);
+  background: var(--red-2);
+  border: 1px solid #efc2bd;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .notice-comment p {

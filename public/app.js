@@ -150,7 +150,9 @@ function bindEvents() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   });
   el.noticeList?.addEventListener("submit", submitNoticeComment);
+  el.noticeList?.addEventListener("click", deleteNoticeComment);
   el.noticeDockList?.addEventListener("submit", submitNoticeComment);
+  el.noticeDockList?.addEventListener("click", deleteNoticeComment);
   el.profileForm?.addEventListener("submit", saveProfile);
   const profilePhoneInput = el.profileForm?.querySelector('[name="phone"]');
   profilePhoneInput?.addEventListener("input", () => {
@@ -419,7 +421,7 @@ function renderNotice(notice, options = {}) {
       ${options.compact ? "" : `
         <div class="notice-comments">
           <strong>댓글 ${comments.length}개</strong>
-          ${comments.length ? comments.map(renderNoticeComment).join("") : `<span class="comment-empty">아직 댓글이 없습니다.</span>`}
+          ${comments.length ? comments.map((comment) => renderNoticeComment(notice.id, comment)).join("") : `<span class="comment-empty">아직 댓글이 없습니다.</span>`}
         </div>
         <form class="notice-comment-form" data-notice-comment-form="${esc(notice.id)}">
           <textarea name="body" maxlength="1000" placeholder="댓글을 입력하세요" required></textarea>
@@ -430,11 +432,15 @@ function renderNotice(notice, options = {}) {
   `;
 }
 
-function renderNoticeComment(comment) {
+function renderNoticeComment(noticeId, comment) {
   const name = comment.storeName || comment.userEmail || comment.userPhone || "회원";
   return `
     <div class="notice-comment">
-      <div><strong>${esc(name)}</strong><span>${formatTime(comment.createdAt)}</span></div>
+      <div>
+        <strong>${esc(name)}</strong>
+        <span>${formatTime(comment.createdAt)}</span>
+        ${comment.canDelete || comment.mine ? `<button class="comment-delete-button" type="button" data-delete-notice-comment="${esc(comment.id)}" data-notice-id="${esc(noticeId)}">삭제</button>` : ""}
+      </div>
       <p>${esc(comment.body || "")}</p>
     </div>
   `;
@@ -462,6 +468,27 @@ async function submitNoticeComment(event) {
     await loadNotices();
     renderNotices();
     toast("댓글을 등록했습니다.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteNoticeComment(event) {
+  const button = event.target.closest("[data-delete-notice-comment]");
+  if (!button) return;
+  const noticeId = button.dataset.noticeId;
+  const commentId = button.dataset.deleteNoticeComment;
+  if (!noticeId || !commentId) return;
+  if (!confirm("이 댓글을 삭제할까요?")) return;
+
+  setBusy(true);
+  try {
+    await api(`/api/notices/${encodeURIComponent(noticeId)}/comments/${encodeURIComponent(commentId)}/delete`, { method: "POST" });
+    await loadNotices();
+    renderNotices();
+    toast("댓글을 삭제했습니다.");
   } catch (error) {
     toast(error.message);
   } finally {

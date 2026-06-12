@@ -297,8 +297,9 @@ async function handleApi(req, res, requestUrl) {
   }
 
   if (method === "GET" && requestUrl.pathname === "/api/notices") {
+    const optionalUser = await getOptionalUser(req);
     const db = await readDb();
-    sendJson(res, 200, buildPublicNotices(db));
+    sendJson(res, 200, buildPublicNotices(db, optionalUser));
     return;
   }
 
@@ -322,6 +323,14 @@ async function handleApi(req, res, requestUrl) {
     const notice = createNoticeComment(db, segments[2], auth.user, body);
     await writeDb(db);
     sendJson(res, 201, { notice });
+    return;
+  }
+
+  if (((method === "POST" && segments[5] === "delete") || method === "DELETE") && segments[0] === "api" && segments[1] === "notices" && segments[2] && segments[3] === "comments" && segments[4]) {
+    const db = auth.db;
+    const result = deleteNoticeComment(db, segments[2], segments[4], { user: auth.user });
+    await writeDb(db);
+    sendJson(res, 200, result);
     return;
   }
 
@@ -671,7 +680,7 @@ async function handleAdminApi(req, res, requestUrl) {
     return;
   }
 
-  if ((req.method === "PATCH" || req.method === "PUT") && adminSegments[0] === "api" && adminSegments[1] === "admin" && adminSegments[2] === "notices" && adminSegments[3]) {
+  if ((req.method === "PATCH" || req.method === "PUT") && adminSegments[0] === "api" && adminSegments[1] === "admin" && adminSegments[2] === "notices" && adminSegments[3] && adminSegments.length === 4) {
     const db = await readDb();
     const body = await readJson(req);
     const notice = updateNotice(db, adminSegments[3], body);
@@ -680,7 +689,15 @@ async function handleAdminApi(req, res, requestUrl) {
     return;
   }
 
-  if (req.method === "DELETE" && adminSegments[0] === "api" && adminSegments[1] === "admin" && adminSegments[2] === "notices" && adminSegments[3]) {
+  if (((req.method === "POST" && adminSegments[6] === "delete") || req.method === "DELETE") && adminSegments[0] === "api" && adminSegments[1] === "admin" && adminSegments[2] === "notices" && adminSegments[3] && adminSegments[4] === "comments" && adminSegments[5]) {
+    const db = await readDb();
+    const result = deleteNoticeComment(db, adminSegments[3], adminSegments[5], { admin: true });
+    await writeDb(db);
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "DELETE" && adminSegments[0] === "api" && adminSegments[1] === "admin" && adminSegments[2] === "notices" && adminSegments[3] && adminSegments.length === 4) {
     const db = await readDb();
     const result = deleteNotice(db, adminSegments[3]);
     await writeDb(db);
@@ -853,16 +870,16 @@ function updateAdminUserSettings(db, userId, body) {
   };
 }
 
-function getNotices(db) {
+function getNotices(db, viewer = null) {
   const notices = Array.isArray(db.meta?.notices) ? db.meta.notices : [];
   return notices
     .filter((notice) => !notice.deletedAt)
     .sort((a, b) => Number(b.createdAt || b.updatedAt || 0) - Number(a.createdAt || a.updatedAt || 0))
-    .map(publicNotice);
+    .map((notice) => publicNotice(notice, viewer));
 }
 
-function buildPublicNotices(db) {
-  const notices = getNotices(db);
+function buildPublicNotices(db, viewer = null) {
+  const notices = getNotices(db, viewer);
   return {
     latest: notices[0] || null,
     previous: notices.slice(1),
@@ -971,10 +988,46 @@ function createNoticeComment(db, noticeId, user, body) {
   });
   notice.comments = notice.comments.slice(-200);
   notice.updatedAt = Date.now();
-  return publicNotice(notice);
+  return publicNotice(notice, user);
 }
 
-function publicNotice(notice) {
+function deleteNoticeComment(db, noticeId, commentId, options = {}) {
+  db.meta = db.meta || {};
+  db.meta.notices = Array.isArray(db.meta.notices) ? db.meta.notices : [];
+  const notice = db.meta.notices.find((item) => item.id === noticeId && !item.deletedAt);
+  if (!notice) {
+    const error = new Error("Notice not found");
+    error.statusCode = 404;
+    error.code = "NOTICE_NOT_FOUND";
+    error.publicMessage = "공지를 찾을 수 없습니다.";
+    throw error;
+  }
+
+  notice.comments = Array.isArray(notice.comments) ? notice.comments : [];
+  const comment = notice.comments.find((item) => item.id === commentId && !item.deletedAt);
+  if (!comment) {
+    const error = new Error("Notice comment not found");
+    error.statusCode = 404;
+    error.code = "NOTICE_COMMENT_NOT_FOUND";
+    error.publicMessage = "댓글을 찾을 수 없습니다.";
+    throw error;
+  }
+
+  if (!options.admin && comment.userId !== options.user?.id) {
+    const error = new Error("Forbidden notice comment delete");
+    error.statusCode = 403;
+    error.code = "COMMENT_DELETE_FORBIDDEN";
+    error.publicMessage = "내가 작성한 댓글만 삭제할 수 있습니다.";
+    throw error;
+  }
+
+  comment.deletedAt = Date.now();
+  comment.deletedBy = options.admin ? "admin" : options.user?.id || "";
+  notice.updatedAt = Date.now();
+  return { ok: true, noticeId, commentId };
+}
+
+function publicNotice(notice, viewer = null) {
   return {
     id: notice.id,
     title: notice.title || "",
@@ -985,18 +1038,21 @@ function publicNotice(notice) {
       .filter((comment) => !comment.deletedAt)
       .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0))
       .slice(-100)
-      .map(publicNoticeComment)
+      .map((comment) => publicNoticeComment(comment, viewer))
   };
 }
 
-function publicNoticeComment(comment) {
+function publicNoticeComment(comment, viewer = null) {
+  const mine = Boolean(viewer?.id && comment.userId === viewer.id);
   return {
     id: comment.id,
     userEmail: maskEmail(comment.userEmail || ""),
     userPhone: maskPhone(comment.userPhone || ""),
     storeName: comment.storeName || "",
     body: comment.body || "",
-    createdAt: comment.createdAt || null
+    createdAt: comment.createdAt || null,
+    mine,
+    canDelete: mine
   };
 }
 
