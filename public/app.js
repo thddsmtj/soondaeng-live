@@ -278,7 +278,7 @@ function renderProducts() {
   el.emptyProducts.hidden = products.length > 0;
   el.productGrid.innerHTML = products.map((product) => {
     const keyword = (product.keywords || [])[0] || {};
-    const items = (product.latestItems || []).slice(0, 8);
+    const items = (product.latestItems || []).slice(0, 50);
     return `
       <article class="product-card keyword-card">
         <div class="product-head">

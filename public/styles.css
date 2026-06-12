@@ -765,7 +765,9 @@ input:focus, textarea:focus, select:focus {
 }
 
 .rank-table-wrap {
+  max-height: 540px;
   overflow-x: auto;
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;

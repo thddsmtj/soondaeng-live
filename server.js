@@ -940,6 +940,7 @@ function buildAdminOverview(db, snapshotLimit) {
   let top10Count = 0;
   let missingCount = 0;
   let errorCount = 0;
+  let collectedItemCount = 0;
   let lastCheckedAt = 0;
   const todayKey = getDateKey(Date.now(), SCHEDULE_TIMEZONE);
   const apiCallsByUser = new Map();
@@ -951,6 +952,7 @@ function buildAdminOverview(db, snapshotLimit) {
 
     for (const keyword of product.keywords || []) {
       keywordCount += 1;
+      if (isKeywordTarget(product)) collectedItemCount += Number(keyword.resultCount || (product.topItems || []).length || 0);
       if (keyword.rank) rankedKeywordCount += 1;
       if (keyword.rank && keyword.rank <= 10) top10Count += 1;
       if (keyword.status === "missing") missingCount += 1;
@@ -985,6 +987,7 @@ function buildAdminOverview(db, snapshotLimit) {
     summary: {
       userCount: users.length,
       productCount: products.length,
+      collectedItemCount,
       keywordCount,
       rankedKeywordCount,
       top10Count,
@@ -1026,6 +1029,8 @@ function buildAdminOverview(db, snapshotLimit) {
 
       return {
         id: product.id,
+        type: product.type || (isKeywordTarget(product) ? "keywordTarget" : "product"),
+        term: product.term || keywords[0]?.term || product.name || "",
         userId: product.userId,
         userEmail: ownerEmail,
         userPhone: ownerPhone,
@@ -1039,6 +1044,8 @@ function buildAdminOverview(db, snapshotLimit) {
         image: product.image || "",
         createdAt: product.createdAt || null,
         keywordCount: keywords.length,
+        resultCount: isKeywordTarget(product) ? Number(keywords[0]?.resultCount || (product.topItems || []).length || 0) : 0,
+        latestItems: isKeywordTarget(product) ? (product.topItems || []).slice(0, RANK_SCAN_LIMIT) : [],
         bestRank,
         lastCheckedAt: lastChecked || null,
         keywords: keywords.map((keyword) => ({
@@ -2608,7 +2615,7 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
       const checkedAt = keyword.lastChecked || product.lastChecked || now;
       const collectionId = uid();
       apiCalls += Number(keyword.lastApiCalls || 0);
-      (product.topItems || []).slice(0, RANK_SCAN_LIMIT).forEach((item) => {
+      (product.topItems || []).slice(0, RANK_SCAN_LIMIT).forEach((item, itemIndex) => {
         db.snapshots.push({
           id: uid(),
           collectionId,
@@ -2627,7 +2634,7 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
           image: item.image || "",
           price: item.lprice || "",
           productNaverId: item.productId || "",
-          apiCalls: 0,
+          apiCalls: itemIndex === 0 ? Number(keyword.lastApiCalls || 0) : 0,
           error: "",
           source: context.source,
           slotKey: context.slotKey || "",
