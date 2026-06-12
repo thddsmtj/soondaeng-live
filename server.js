@@ -1146,45 +1146,64 @@ function buildRankReport(db, options = {}) {
   const users = new Map((db.users || []).map((user) => [user.id, user]));
   const products = (db.products || [])
     .filter((product) => !options.userId || product.userId === options.userId)
-    .filter((product) => !product.disabled);
+    .filter((product) => !product.disabled)
+    .filter((product) => isKeywordTarget(product));
   const snapshots = (db.snapshots || [])
     .filter((snapshot) => Number(snapshot.checkedAt || 0) >= since && Number(snapshot.checkedAt || 0) <= now)
     .filter((snapshot) => !options.userId || snapshot.userId === options.userId);
-  const snapshotsByKey = new Map();
+  const snapshotsByTarget = new Map();
 
   for (const snapshot of snapshots) {
-    const key = `${snapshot.productId}:${snapshot.keywordId}`;
-    if (!snapshotsByKey.has(key)) snapshotsByKey.set(key, []);
-    snapshotsByKey.get(key).push(snapshot);
+    const key = snapshot.productId || "";
+    if (!snapshotsByTarget.has(key)) snapshotsByTarget.set(key, []);
+    snapshotsByTarget.get(key).push(snapshot);
   }
 
   const thresholdDrops = [];
   const rangeDrops = [];
   const newEntries = [];
+  const rankChanges = [];
   const rawRows = [];
+  const keywordReports = [];
 
   for (const product of products) {
     const owner = users.get(product.userId);
-    for (const keyword of product.keywords || []) {
-      const key = `${product.id}:${keyword.id}`;
-      const records = normalizeReportRecords(snapshotsByKey.get(key) || [], product, keyword, now);
-      records.forEach((record) => {
-        rawRows.push(reportRawRow(product, keyword, owner, record));
-      });
+    const keyword = (product.keywords || [])[0] || {};
+    const rows = (snapshotsByTarget.get(product.id) || [])
+      .filter((snapshot) => snapshot.status !== "error")
+      .sort((a, b) => Number(a.checkedAt || 0) - Number(b.checkedAt || 0) || Number(a.rank || 0) - Number(b.rank || 0));
+    rows.forEach((record) => rawRows.push(keywordRankRawRow(product, keyword, owner, record)));
 
-      thresholdDrops.push(...findThresholdDropEvents(product, keyword, owner, records));
-      const rangeDrop = findRangeDropEvent(product, keyword, owner, records);
-      if (rangeDrop) rangeDrops.push(rangeDrop);
-      newEntries.push(...findNewEntryEvents(product, keyword, owner, records));
-    }
+    const collections = buildKeywordCollections(rows);
+    const comparison = compareKeywordCollections(product, keyword, owner, collections);
+    thresholdDrops.push(...comparison.thresholdDrops);
+    rangeDrops.push(...comparison.rangeDrops);
+    newEntries.push(...comparison.newEntries);
+    rankChanges.push(...comparison.rankChanges);
+    keywordReports.push({
+      targetId: product.id,
+      keyword: product.term || keyword.term || product.name || "",
+      configuredRanks: normalizeRankThresholds(product.alertRanks || keyword.alertRanks),
+      dropThreshold: normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold),
+      collectionCount: collections.length,
+      days: collections.map((collection) => ({
+        dateKey: collection.dateKey,
+        checkedAt: collection.checkedAt,
+        count: collection.items.length
+      })),
+      latestItems: collections.at(-1)?.items || [],
+      changes: comparison.rankChanges.slice(0, 100)
+    });
   }
 
+  const latestItemCount = keywordReports.reduce((sum, item) => sum + (item.latestItems || []).length, 0);
   const summary = {
-    productCount: products.length,
-    keywordCount: products.reduce((sum, product) => sum + (product.keywords || []).length, 0),
+    productCount: latestItemCount,
+    keywordCount: products.length,
     thresholdDropCount: thresholdDrops.length,
     rangeDropCount: rangeDrops.length,
     newEntryCount: newEntries.length,
+    rankChangeCount: rankChanges.length,
     generatedAt: now,
     windowStart: since,
     windowEnd: now
@@ -1200,11 +1219,211 @@ function buildRankReport(db, options = {}) {
     thresholdDrops,
     rangeDrops,
     newEntries,
-    rawRows: rawRows.sort((a, b) => String(a.productName).localeCompare(String(b.productName), "ko") || String(a.keyword).localeCompare(String(b.keyword), "ko") || Number(a.checkedAt || 0) - Number(b.checkedAt || 0)),
+    rankChanges,
+    keywordReports,
+    rawRows: rawRows.sort((a, b) => String(a.keyword).localeCompare(String(b.keyword), "ko") || Number(a.checkedAt || 0) - Number(b.checkedAt || 0) || Number(a.rankNumber || 0) - Number(b.rankNumber || 0)),
     email: {
       configured: Boolean(RESEND_API_KEY && REPORT_FROM && REPORT_RECIPIENTS.length),
       recipients: REPORT_RECIPIENTS
     }
+  };
+}
+
+function buildKeywordCollections(rows) {
+  const byCollection = new Map();
+  for (const row of rows || []) {
+    const checkedAt = Number(row.checkedAt || 0);
+    if (!checkedAt) continue;
+    const dateKey = row.dateKey || getDateKey(checkedAt, SCHEDULE_TIMEZONE);
+    const collectionId = row.collectionId || `${dateKey}:${checkedAt}`;
+    if (!byCollection.has(collectionId)) {
+      byCollection.set(collectionId, {
+        collectionId,
+        dateKey,
+        checkedAt,
+        items: []
+      });
+    }
+    const collection = byCollection.get(collectionId);
+    collection.checkedAt = Math.max(collection.checkedAt, checkedAt);
+    collection.items.push(snapshotToRankItem(row));
+  }
+
+  const latestByDay = new Map();
+  for (const collection of byCollection.values()) {
+    collection.items.sort((a, b) => Number(a.rank || 0) - Number(b.rank || 0));
+    const current = latestByDay.get(collection.dateKey);
+    if (!current || collection.checkedAt > current.checkedAt) latestByDay.set(collection.dateKey, collection);
+  }
+
+  return [...latestByDay.values()].sort((a, b) => a.checkedAt - b.checkedAt);
+}
+
+function snapshotToRankItem(snapshot) {
+  return {
+    rank: normalizeReportRank(snapshot.rank),
+    itemKey: snapshot.itemKey || snapshot.productNaverId || snapshot.productUrl || "",
+    productName: snapshot.productName || "",
+    productUrl: snapshot.productUrl || "",
+    storeName: snapshot.storeName || "",
+    image: snapshot.image || "",
+    price: snapshot.price || "",
+    checkedAt: snapshot.checkedAt || null
+  };
+}
+
+function compareKeywordCollections(product, keyword, owner, collections) {
+  const thresholdDrops = [];
+  const newEntries = [];
+  const rankChanges = [];
+
+  for (let index = 1; index < collections.length; index += 1) {
+    const previous = collections[index - 1];
+    const current = collections[index];
+    const prevMap = rankItemMap(previous.items);
+    const currentMap = rankItemMap(current.items);
+    const keys = new Set([...prevMap.keys(), ...currentMap.keys()]);
+
+    for (const key of keys) {
+      const prev = prevMap.get(key) || null;
+      const next = currentMap.get(key) || null;
+      const prevRank = prev?.rank || null;
+      const nextRank = next?.rank || null;
+      const item = next || prev;
+
+      if (!prevRank && nextRank) {
+        newEntries.push(keywordEventRow(product, keyword, owner, item, {
+          type: "50위 밖에서 신규 진입",
+          threshold: RANK_SCAN_LIMIT,
+          fromRank: null,
+          toRank: nextRank,
+          fromAt: previous.checkedAt,
+          toAt: current.checkedAt,
+          detail: `${previous.dateKey} 50위 밖 -> ${current.dateKey} ${nextRank}위`
+        }));
+      }
+
+      if (prevRank && (nextRank || RANK_SCAN_LIMIT + 1) !== prevRank) {
+        const effectiveNext = nextRank || RANK_SCAN_LIMIT + 1;
+        const diff = effectiveNext - prevRank;
+        rankChanges.push(keywordEventRow(product, keyword, owner, item, {
+          type: diff > 0 ? "순위 하락" : "순위 상승",
+          fromRank: prevRank,
+          toRank: nextRank,
+          fromAt: previous.checkedAt,
+          toAt: current.checkedAt,
+          drop: diff > 0 ? diff : "",
+          detail: `${previous.dateKey} ${prevRank}위 -> ${current.dateKey} ${rankLabel(nextRank)}`
+        }));
+      }
+
+      for (const threshold of normalizeRankThresholds(product.alertRanks || keyword.alertRanks)) {
+        if (isInsideRank(prevRank, threshold) && !isInsideRank(nextRank, threshold)) {
+          thresholdDrops.push(keywordEventRow(product, keyword, owner, item, {
+            type: "기준순위 밖 이탈",
+            threshold,
+            fromRank: prevRank,
+            toRank: nextRank,
+            fromAt: previous.checkedAt,
+            toAt: current.checkedAt,
+            detail: `${previous.dateKey} ${prevRank}위 -> ${current.dateKey} ${rankLabel(nextRank)}`
+          }));
+        }
+      }
+    }
+  }
+
+  return {
+    thresholdDrops,
+    rangeDrops: findKeywordRangeDropEvents(product, keyword, owner, collections),
+    newEntries,
+    rankChanges
+  };
+}
+
+function rankItemMap(items) {
+  return new Map((items || []).filter((item) => item.itemKey).map((item) => [item.itemKey, item]));
+}
+
+function findKeywordRangeDropEvents(product, keyword, owner, collections) {
+  const threshold = normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold);
+  const byItem = new Map();
+  for (const collection of collections) {
+    for (const item of collection.items || []) {
+      if (!item.itemKey) continue;
+      if (!byItem.has(item.itemKey)) byItem.set(item.itemKey, []);
+      byItem.get(item.itemKey).push({ ...item, checkedAt: collection.checkedAt, dateKey: collection.dateKey });
+    }
+  }
+
+  const events = [];
+  for (const records of byItem.values()) {
+    let best = null;
+    for (let left = 0; left < records.length; left += 1) {
+      for (let right = left + 1; right < records.length; right += 1) {
+        const fromRank = records[left].rank;
+        const toRank = records[right].rank;
+        if (!fromRank || !toRank) continue;
+        const drop = toRank - fromRank;
+        if (drop >= threshold && (!best || drop > best.drop)) {
+          best = { item: records[right], fromRank, toRank, drop, fromAt: records[left].checkedAt, toAt: records[right].checkedAt };
+        }
+      }
+    }
+    if (best) {
+      events.push(keywordEventRow(product, keyword, owner, best.item, {
+        type: "지정 하락폭 이상",
+        threshold,
+        fromRank: best.fromRank,
+        toRank: best.toRank,
+        fromAt: best.fromAt,
+        toAt: best.toAt,
+        drop: best.drop,
+        detail: `${formatReportDate(best.fromAt)} ${best.fromRank}위 -> ${formatReportDate(best.toAt)} ${best.toRank}위, ${best.drop}위 하락`
+      }));
+    }
+  }
+  return events;
+}
+
+function keywordEventRow(product, keyword, owner, item, event) {
+  return {
+    eventType: event.type || "",
+    userEmail: owner?.email || "",
+    userPhone: normalizePhone(owner?.phone),
+    storeName: item?.storeName || "",
+    productName: item?.productName || "",
+    productUrl: item?.productUrl || "",
+    keyword: product.term || keyword.term || product.name || "",
+    configuredRanks: normalizeRankThresholds(product.alertRanks || keyword.alertRanks).join(", "),
+    dropThreshold: normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold),
+    threshold: event.threshold || "",
+    fromRank: rankLabel(event.fromRank),
+    toRank: rankLabel(event.toRank),
+    drop: event.drop || "",
+    fromAt: event.fromAt || null,
+    toAt: event.toAt || null,
+    detail: event.detail || ""
+  };
+}
+
+function keywordRankRawRow(product, keyword, owner, record) {
+  return {
+    userEmail: owner?.email || "",
+    userPhone: normalizePhone(owner?.phone),
+    storeName: record.storeName || "",
+    productName: record.productName || "",
+    productUrl: record.productUrl || "",
+    keyword: product.term || keyword.term || product.name || record.term || "",
+    configuredRanks: normalizeRankThresholds(product.alertRanks || keyword.alertRanks).join(", "),
+    dropThreshold: normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold),
+    rank: rankLabel(record.rank),
+    rankNumber: Number(record.rank || 0),
+    checkedAt: record.checkedAt || null,
+    dateKey: record.dateKey || getDateKey(record.checkedAt || Date.now(), SCHEDULE_TIMEZONE),
+    source: record.source || "",
+    status: record.status || "",
+    error: record.error || ""
   };
 }
 
@@ -1423,6 +1642,7 @@ async function sendRankReportEmail(report, workbook) {
         `기준순위 밖 이탈: ${report.summary.thresholdDropCount}건`,
         `지정 하락폭 이상: ${report.summary.rangeDropCount}건`,
         `50위 밖 신규 진입: ${report.summary.newEntryCount}건`,
+        `순위 변동: ${report.summary.rankChangeCount || 0}건`,
         "",
         "상세 내용은 첨부된 엑셀 파일을 확인해 주세요."
       ].join("\n"),
@@ -1458,11 +1678,12 @@ function buildRankReportWorkbook(report) {
         ["생성시각", formatReportDate(report.generatedAt)],
         ["기간시작", formatReportDate(report.windowStart)],
         ["기간종료", formatReportDate(report.windowEnd)],
-        ["상품수", report.summary.productCount],
-        ["키워드수", report.summary.keywordCount],
+        ["추적키워드수", report.summary.keywordCount],
+        ["최신수집상품수", report.summary.productCount],
         ["기준순위 밖 이탈", report.summary.thresholdDropCount],
         ["지정 하락폭 이상", report.summary.rangeDropCount],
-        ["50위 밖 신규 진입", report.summary.newEntryCount]
+        ["50위 밖 신규 진입", report.summary.newEntryCount],
+        ["순위변동", report.summary.rankChangeCount]
       ]
     },
     {
@@ -1478,20 +1699,25 @@ function buildRankReportWorkbook(report) {
       rows: eventRowsForWorkbook(report.newEntries)
     },
     {
+      name: "순위변동",
+      rows: eventRowsForWorkbook(report.rankChanges || [])
+    },
+    {
       name: "원본순위",
       rows: [
-        ["회원이메일", "전화번호", "스토어", "상품명", "상품URL", "키워드", "기준순위", "하락폭기준", "순위", "조회시각", "출처", "상태", "오류"],
+        ["회원이메일", "전화번호", "키워드", "조회일", "조회시각", "순위", "스토어", "상품명", "상품URL", "기준순위", "하락폭기준", "출처", "상태", "오류"],
         ...report.rawRows.map((row) => [
           row.userEmail,
           row.userPhone,
+          row.keyword,
+          row.dateKey,
+          formatReportDate(row.checkedAt),
+          row.rank,
           row.storeName,
           row.productName,
           row.productUrl,
-          row.keyword,
           row.configuredRanks,
           row.dropThreshold,
-          row.rank,
-          formatReportDate(row.checkedAt),
           row.source,
           row.status,
           row.error
@@ -1895,48 +2121,21 @@ async function createProduct(req, res, user, body) {
     return;
   }
 
-  const keywordConfigs = parseKeywordConfigs(body);
-  const keywords = keywordConfigs.map((item) => item.term);
-  const url = String(body.url || "").trim().slice(0, 500);
-  const providedProductId = String(body.productId || "").trim().slice(0, 80);
-  const inferredProductId = extractProductIdFromUrl(url) || providedProductId;
+  const keywordConfigs = parseKeywordTargetConfigs(body);
 
-  if (!url || !keywords.length) {
-    sendJson(res, 400, { error: "INVALID_PRODUCT", message: "상품 URL과 추적 키워드는 필수입니다." });
+  if (!keywordConfigs.length) {
+    sendJson(res, 400, { error: "INVALID_KEYWORD", message: "등록할 키워드를 입력해 주세요." });
     return;
   }
 
   const now = Date.now();
-  const duplicate = findDuplicateProduct(db.products, user.id, url, inferredProductId);
+  const duplicate = findDuplicateKeywordTarget(db.products, user.id, keywordConfigs[0].term);
   if (duplicate) {
-    sendJson(res, 409, { error: "DUPLICATE_PRODUCT", message: "이미 등록된 상품입니다.", product: duplicate });
+    sendJson(res, 409, { error: "DUPLICATE_KEYWORD", message: "이미 등록된 키워드입니다.", product: duplicate });
     return;
   }
 
-  const product = {
-    id: uid(),
-    userId: user.id,
-    name: String(body.name || "").trim().slice(0, 120) || "상품 확인중",
-    store: String(body.store || "").trim().slice(0, 80) || "스토어 확인중",
-    productId: inferredProductId,
-    url,
-    image: "",
-    createdAt: now,
-    keywords: keywordConfigs.map((config) => ({
-      id: uid(),
-      term: config.term,
-      alertRanks: config.alertRanks,
-      dropThreshold: config.dropThreshold,
-      rank: null,
-      prevRank: null,
-      bestRank: null,
-      status: "pending",
-      history: [],
-      lastChecked: null,
-      lastError: "",
-      matchedBy: ""
-    }))
-  };
+  const product = createKeywordTarget(user, keywordConfigs[0], now);
 
   const trackedProduct = await trackProduct(product, trackingContext("registration"));
   db.products.unshift(trackedProduct);
@@ -1966,9 +2165,9 @@ async function bulkCreateProducts(req, res, user, body) {
     return;
   }
 
-  const rows = parseBulkProducts(body);
+  const rows = parseKeywordTargetConfigs(body);
   if (!rows.length) {
-    sendJson(res, 400, { error: "INVALID_BULK", message: "등록할 상품 목록을 입력해 주세요." });
+    sendJson(res, 400, { error: "INVALID_BULK", message: "등록할 키워드 목록을 입력해 주세요." });
     return;
   }
 
@@ -1997,46 +2196,19 @@ async function bulkCreateProducts(req, res, user, body) {
     }
 
     const row = rows[index];
-    const keywordConfigs = parseKeywordConfigs(row);
-    const keywords = keywordConfigs.map((item) => item.term);
-    const url = String(row.url || "").trim().slice(0, 500);
-    const providedProductId = String(row.productId || "").trim().slice(0, 80);
-    const inferredProductId = extractProductIdFromUrl(url) || providedProductId;
+    const term = String(row.term || "").trim();
 
-    if (!url || !keywords.length) {
-      errors.push({ row: index + 1, message: "상품 URL과 추적 키워드는 필수입니다." });
+    if (!term) {
+      errors.push({ row: index + 1, message: "키워드는 필수입니다." });
       continue;
     }
 
-    if (findDuplicateProduct([...db.products, ...created], user.id, url, inferredProductId)) {
-      errors.push({ row: index + 1, message: "이미 등록된 상품입니다." });
+    if (findDuplicateKeywordTarget([...db.products, ...created], user.id, term)) {
+      errors.push({ row: index + 1, message: "이미 등록된 키워드입니다." });
       continue;
     }
 
-    const product = {
-      id: uid(),
-      userId: user.id,
-      name: String(row.name || "").trim().slice(0, 120) || "상품 확인중",
-      store: String(row.store || "").trim().slice(0, 80) || "스토어 확인중",
-      productId: inferredProductId,
-      url,
-      image: "",
-      createdAt: now - index,
-      keywords: keywordConfigs.map((config) => ({
-        id: uid(),
-        term: config.term,
-        alertRanks: config.alertRanks,
-        dropThreshold: config.dropThreshold,
-        rank: null,
-        prevRank: null,
-        bestRank: null,
-        status: "pending",
-        history: [],
-        lastChecked: null,
-        lastError: "",
-        matchedBy: ""
-      }))
-    };
+    const product = createKeywordTarget(user, row, now - index);
 
     try {
       created.push(await trackProduct(product, trackingContext("bulk")));
@@ -2123,6 +2295,10 @@ async function trackKeywordRoute(req, res, user, productId, keywordId) {
 }
 
 async function trackProduct(product, context = trackingContext("manual")) {
+  if (isKeywordTarget(product)) {
+    return trackKeywordTarget(product, context);
+  }
+
   const tracked = structuredClone(product);
   await enrichProductFromPage(tracked);
   const nextKeywords = [];
@@ -2133,6 +2309,92 @@ async function trackProduct(product, context = trackingContext("manual")) {
 
   tracked.keywords = nextKeywords;
   return tracked;
+}
+
+async function trackKeywordTarget(product, context = trackingContext("manual")) {
+  const tracked = structuredClone(product);
+  const keyword = (tracked.keywords || [])[0] || {
+    id: uid(),
+    term: tracked.term || tracked.name || "",
+    alertRanks: normalizeRankThresholds(tracked.alertRanks),
+    dropThreshold: normalizeDropThreshold(tracked.dropThreshold)
+  };
+  const checkedAt = Date.now();
+  tracked.type = "keywordTarget";
+  tracked.term = String(tracked.term || keyword.term || tracked.name || "").trim();
+  tracked.name = tracked.term;
+  tracked.url = "";
+  tracked.store = "";
+  tracked.productId = "";
+
+  try {
+    const scan = await scanNaverTopItems(tracked.term);
+    const nextKeyword = buildKeywordTargetKeywordFromScan(keyword, scan, context, checkedAt);
+    tracked.keywords = [nextKeyword];
+    tracked.alertRanks = nextKeyword.alertRanks;
+    tracked.dropThreshold = nextKeyword.dropThreshold;
+    tracked.topItems = scan.items;
+    tracked.updatedAt = checkedAt;
+    tracked.lastChecked = checkedAt;
+    tracked.lastError = "";
+    return tracked;
+  } catch (error) {
+    const nextKeyword = buildKeywordTargetKeywordFromError(keyword, error, context, checkedAt);
+    tracked.keywords = [nextKeyword];
+    tracked.alertRanks = nextKeyword.alertRanks;
+    tracked.dropThreshold = nextKeyword.dropThreshold;
+    tracked.topItems = Array.isArray(tracked.topItems) ? tracked.topItems : [];
+    tracked.updatedAt = checkedAt;
+    tracked.lastChecked = checkedAt;
+    tracked.lastError = nextKeyword.lastError;
+    return tracked;
+  }
+}
+
+function buildKeywordTargetKeywordFromScan(keyword, scan, context, checkedAt = Date.now()) {
+  const resultCount = (scan.items || []).length;
+  const firstRank = resultCount ? 1 : null;
+  const history = [...(keyword.history || []).slice(-29), resultCount];
+  const graphHistory = context.graphEligible
+    ? [...(keyword.graphHistory || []).slice(-89), resultCount]
+    : Array.isArray(keyword.graphHistory) ? keyword.graphHistory : [];
+
+  return {
+    ...keyword,
+    alertRanks: normalizeRankThresholds(keyword.alertRanks),
+    dropThreshold: normalizeDropThreshold(keyword.dropThreshold),
+    rank: firstRank,
+    prevRank: keyword.rank || null,
+    bestRank: firstRank,
+    status: resultCount ? "completed" : "missing",
+    history,
+    graphHistory,
+    lastChecked: checkedAt,
+    lastError: resultCount ? "" : "네이버 쇼핑 검색 결과가 없습니다.",
+    matchedBy: "top50",
+    lastApiCalls: scan.apiCalls || 0,
+    resultCount
+  };
+}
+
+function buildKeywordTargetKeywordFromError(keyword, error, context, checkedAt = Date.now()) {
+  const message = error.publicMessage || "키워드 순위 수집 중 오류가 발생했습니다.";
+  return {
+    ...keyword,
+    alertRanks: normalizeRankThresholds(keyword.alertRanks),
+    dropThreshold: normalizeDropThreshold(keyword.dropThreshold),
+    prevRank: keyword.rank || null,
+    status: "error",
+    history: [...(keyword.history || []).slice(-29), 0],
+    graphHistory: context.graphEligible
+      ? [...(keyword.graphHistory || []).slice(-89), 0]
+      : Array.isArray(keyword.graphHistory) ? keyword.graphHistory : [],
+    lastChecked: checkedAt,
+    lastError: message,
+    matchedBy: "top50",
+    lastApiCalls: error.apiCalls || 0,
+    resultCount: 0
+  };
 }
 
 async function trackKeyword(product, keyword, context = trackingContext("manual")) {
@@ -2191,56 +2453,10 @@ function buildTrackedKeywordFromError(keyword, error, context, checkedAt = Date.
 }
 
 async function trackProductsBatched(products, context = trackingContext("manual")) {
-  const trackedProducts = (products || []).map((product) => structuredClone(product));
-  const keywordGroups = new Map();
-
-  for (const product of trackedProducts) {
-    applyProductInfoFallback(product);
-    for (const keyword of product.keywords || []) {
-      const key = normalizeKeywordKey(keyword.term);
-      if (!key) continue;
-      if (!keywordGroups.has(key)) {
-        keywordGroups.set(key, {
-          term: String(keyword.term || "").trim(),
-          targets: []
-        });
-      }
-      keywordGroups.get(key).targets.push({ product, keyword });
-    }
+  const trackedProducts = [];
+  for (const product of products || []) {
+    trackedProducts.push(await trackProduct(product, context));
   }
-
-  for (const group of keywordGroups.values()) {
-    const checkedAt = Date.now();
-    let allocations = [];
-    try {
-      const scan = await scanNaverKeywordBatch(group.term, group.targets);
-      allocations = allocateApiCalls(scan.apiCalls, group.targets.length);
-      group.targets.forEach((target, index) => {
-        const result = scan.results.get(index) || { rank: null, matchedBy: "", item: null };
-        if (result.item) applyMatchedItem(target.product, result.item);
-        const nextKeyword = buildTrackedKeywordFromScan(
-          target.product,
-          target.keyword,
-          { ...result, apiCalls: allocations[index] || 0 },
-          context,
-          checkedAt
-        );
-        replaceProductKeyword(target.product, target.keyword.id, nextKeyword);
-      });
-    } catch (error) {
-      allocations = allocateApiCalls(error.apiCalls || 0, group.targets.length);
-      group.targets.forEach((target, index) => {
-        const nextKeyword = buildTrackedKeywordFromError(
-          target.keyword,
-          { ...error, apiCalls: allocations[index] || 0 },
-          context,
-          checkedAt
-        );
-        replaceProductKeyword(target.product, target.keyword.id, nextKeyword);
-      });
-    }
-  }
-
   return trackedProducts;
 }
 
@@ -2292,6 +2508,32 @@ async function scanNaverKeywordBatch(term, targets) {
   }
 
   return { results, apiCalls };
+}
+
+async function scanNaverTopItems(term) {
+  if (!NAVER_CLIENT_ID || !NAVER_CLIENT_SECRET) {
+    const error = new Error("Missing Naver API keys");
+    error.publicMessage = "네이버 API 키가 서버에 설정되지 않았습니다.";
+    throw error;
+  }
+
+  const response = await fetchNaverShoppingPage(term, 1, RANK_SCAN_LIMIT);
+  if (!response.ok) {
+    const body = await response.text();
+    const error = new Error(`Naver API error ${response.status}: ${body}`);
+    error.apiCalls = 1;
+    error.publicMessage = response.status === 403
+      ? "네이버 검색 API 권한을 확인하세요."
+      : `네이버 API 오류가 발생했습니다. (${response.status})`;
+    throw error;
+  }
+
+  const payload = await response.json();
+  const items = (Array.isArray(payload.items) ? payload.items : [])
+    .slice(0, RANK_SCAN_LIMIT)
+    .map((item, index) => normalizeRankedNaverItem(item, index + 1));
+
+  return { items, apiCalls: 1 };
 }
 
 function fetchNaverShoppingPage(term, start, display) {
@@ -2359,8 +2601,70 @@ function appendSnapshotsForProducts(db, trackedProducts, context = trackingConte
 
 function appendSnapshotRows(db, trackedProducts, context = trackingContext("manual"), forcedUserId = "") {
   const now = Date.now();
+  let apiCalls = 0;
   (trackedProducts || []).forEach((product) => {
+    if (isKeywordTarget(product)) {
+      const keyword = (product.keywords || [])[0] || {};
+      const checkedAt = keyword.lastChecked || product.lastChecked || now;
+      const collectionId = uid();
+      apiCalls += Number(keyword.lastApiCalls || 0);
+      (product.topItems || []).slice(0, RANK_SCAN_LIMIT).forEach((item) => {
+        db.snapshots.push({
+          id: uid(),
+          collectionId,
+          userId: forcedUserId || product.userId,
+          productId: product.id,
+          keywordId: keyword.id || "",
+          term: keyword.term || product.term || product.name || "",
+          rank: item.rank || null,
+          status: "completed",
+          checkedAt,
+          dateKey: getDateKey(checkedAt, SCHEDULE_TIMEZONE),
+          itemKey: item.itemKey || item.productId || item.link || "",
+          productName: item.title || "",
+          productUrl: item.link || "",
+          storeName: item.mallName || "",
+          image: item.image || "",
+          price: item.lprice || "",
+          productNaverId: item.productId || "",
+          apiCalls: 0,
+          error: "",
+          source: context.source,
+          slotKey: context.slotKey || "",
+          graphEligible: Boolean(context.graphEligible)
+        });
+      });
+      if (keyword.status === "error") {
+        db.snapshots.push({
+          id: uid(),
+          collectionId,
+          userId: forcedUserId || product.userId,
+          productId: product.id,
+          keywordId: keyword.id || "",
+          term: keyword.term || product.term || product.name || "",
+          rank: null,
+          status: "error",
+          checkedAt,
+          dateKey: getDateKey(checkedAt, SCHEDULE_TIMEZONE),
+          itemKey: "",
+          productName: "",
+          productUrl: "",
+          storeName: "",
+          image: "",
+          price: "",
+          productNaverId: "",
+          apiCalls: 0,
+          error: keyword.lastError || "수집 오류",
+          source: context.source,
+          slotKey: context.slotKey || "",
+          graphEligible: Boolean(context.graphEligible)
+        });
+      }
+      return;
+    }
+
     product.keywords.forEach((keyword) => {
+      apiCalls += Number(keyword.lastApiCalls || 0);
       db.snapshots.push({
         id: uid(),
         userId: forcedUserId || product.userId,
@@ -2379,11 +2683,15 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
     });
   });
 
-  const apiCalls = (trackedProducts || []).reduce((sum, product) => sum + (product.keywords || [])
-    .reduce((keywordSum, keyword) => keywordSum + Number(keyword.lastApiCalls || 0), 0), 0);
   addApiUsage(db, apiCalls, now);
+  pruneOldSnapshots(db, now);
 
   if (db.snapshots.length > 10000) db.snapshots = db.snapshots.slice(-10000);
+}
+
+function pruneOldSnapshots(db, now = Date.now()) {
+  const since = now - 7 * 86400000;
+  db.snapshots = (db.snapshots || []).filter((snapshot) => Number(snapshot.checkedAt || 0) >= since);
 }
 
 function startScheduleWorker() {
@@ -2737,6 +3045,57 @@ function findDuplicateProduct(products, userId, url, productId) {
   }) || null;
 }
 
+function findDuplicateKeywordTarget(products, userId, term) {
+  const key = normalizeKeywordKey(term);
+  if (!key) return null;
+  return (products || []).find((product) => product.userId === userId && isKeywordTarget(product) && normalizeKeywordKey(product.term || product.name) === key) || null;
+}
+
+function isKeywordTarget(product) {
+  return product?.type === "keywordTarget" || Boolean(product?.term && !String(product?.url || "").trim());
+}
+
+function createKeywordTarget(user, config, createdAt = Date.now()) {
+  const term = String(config.term || "").trim().slice(0, 120);
+  const alertRanks = normalizeRankThresholds(config.alertRanks);
+  const dropThreshold = normalizeDropThreshold(config.dropThreshold);
+  const keyword = {
+    id: uid(),
+    term,
+    alertRanks,
+    dropThreshold,
+    rank: null,
+    prevRank: null,
+    bestRank: null,
+    status: "pending",
+    history: [],
+    graphHistory: [],
+    lastChecked: null,
+    lastError: "",
+    matchedBy: "top50",
+    lastApiCalls: 0,
+    resultCount: 0
+  };
+
+  return {
+    id: uid(),
+    type: "keywordTarget",
+    userId: user.id,
+    term,
+    name: term,
+    store: "",
+    productId: "",
+    url: "",
+    image: "",
+    alertRanks,
+    dropThreshold,
+    createdAt,
+    updatedAt: createdAt,
+    topItems: [],
+    keywords: [keyword]
+  };
+}
+
 function applyMatchedItem(product, item) {
   if (!item) return;
   const title = stripHtml(item.title);
@@ -2951,6 +3310,38 @@ function splitKeywords(value) {
     .slice(0, 30);
 }
 
+function parseKeywordTargetConfigs(body) {
+  if (Array.isArray(body.rows)) {
+    return body.rows
+      .map((row) => ({
+        term: String(row?.term || row?.keyword || row?.keywords || "").trim(),
+        alertRanks: normalizeRankThresholds(row?.alertRanks || row?.ranks || row?.rankThresholds),
+        dropThreshold: normalizeDropThreshold(row?.dropThreshold || row?.drop || row?.fall)
+      }))
+      .filter((item) => item.term)
+      .slice(0, 30);
+  }
+
+  if (Array.isArray(body.keywordConfigs)) {
+    return body.keywordConfigs
+      .map((item) => ({
+        term: String(item?.term || item?.keyword || "").trim(),
+        alertRanks: normalizeRankThresholds(item?.alertRanks || item?.ranks || item?.rankThresholds),
+        dropThreshold: normalizeDropThreshold(item?.dropThreshold || item?.drop || item?.fall)
+      }))
+      .filter((item) => item.term)
+      .slice(0, 30);
+  }
+
+  const defaultAlertRanks = normalizeRankThresholds(body.alertRanks || body.ranks || body.rankThresholds);
+  const defaultDropThreshold = normalizeDropThreshold(body.dropThreshold || body.drop || body.fall);
+  return splitKeywords(body.term || body.keyword || body.keywords).map((term) => ({
+    term,
+    alertRanks: defaultAlertRanks,
+    dropThreshold: defaultDropThreshold
+  }));
+}
+
 function parseKeywordConfigs(body) {
   if (Array.isArray(body.keywordConfigs)) {
     return body.keywordConfigs
@@ -2979,12 +3370,12 @@ function normalizeRankThresholds(value) {
     .filter((rank) => Number.isInteger(rank) && rank >= 1 && rank <= RANK_SCAN_LIMIT))]
     .sort((a, b) => a - b)
     .slice(0, 3);
-  return ranks.length ? ranks : [10];
+  return ranks.length ? ranks : [15];
 }
 
 function normalizeDropThreshold(value) {
   const threshold = Number(value);
-  return Number.isInteger(threshold) && threshold >= 1 && threshold <= RANK_SCAN_LIMIT ? threshold : 15;
+  return Number.isInteger(threshold) && threshold >= 1 && threshold <= RANK_SCAN_LIMIT ? threshold : 10;
 }
 
 function sanitizeNaverItem(item) {
@@ -2995,6 +3386,41 @@ function sanitizeNaverItem(item) {
     link: item.link || "",
     image: item.image || ""
   };
+}
+
+function normalizeRankedNaverItem(item, rank) {
+  const sanitized = sanitizeNaverItem(item || {});
+  const link = String(sanitized.link || item?.link || "").trim();
+  const productId = String(sanitized.productId || item?.productId || "").trim();
+  return {
+    rank,
+    itemKey: productId ? `pid:${productId}` : `url:${normalizeItemUrl(link) || link}`,
+    title: sanitized.title || "",
+    mallName: sanitized.mallName || "",
+    productId,
+    link,
+    image: sanitized.image || "",
+    lprice: item?.lprice || "",
+    hprice: item?.hprice || "",
+    maker: item?.maker || "",
+    brand: item?.brand || "",
+    category1: item?.category1 || "",
+    category2: item?.category2 || "",
+    category3: item?.category3 || "",
+    category4: item?.category4 || ""
+  };
+}
+
+function normalizeItemUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return raw;
+  }
 }
 
 function stripHtml(value) {
@@ -3144,6 +3570,31 @@ function publicUser(user) {
 
 function publicProduct(product, db = null, userId = product.userId) {
   const collectionRecords = db ? buildProductCollectionRecords(db, userId, product) : [];
+  if (isKeywordTarget(product)) {
+    const keyword = (product.keywords || [])[0] || {};
+    return {
+      id: product.id,
+      type: "keywordTarget",
+      userId: product.userId,
+      term: product.term || product.name || keyword.term || "",
+      name: product.term || product.name || keyword.term || "",
+      store: "",
+      productId: "",
+      url: "",
+      image: "",
+      alertRanks: normalizeRankThresholds(product.alertRanks || keyword.alertRanks),
+      dropThreshold: normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold),
+      createdAt: product.createdAt || null,
+      updatedAt: product.updatedAt || null,
+      collectionRecords,
+      collectionCount: collectionRecords.length,
+      lastCollectionAt: collectionRecords[0]?.checkedAt || keyword.lastChecked || null,
+      latestItems: (product.topItems || []).slice(0, RANK_SCAN_LIMIT),
+      resultCount: keyword.resultCount || (product.topItems || []).length || 0,
+      keywords: [publicKeyword(keyword)]
+    };
+  }
+
   return {
     id: product.id,
     userId: product.userId,
@@ -3179,6 +3630,13 @@ function buildProductCollectionRecords(db, userId, product, limit = 300) {
       rank: snapshot.rank || null,
       status: snapshot.status || "pending",
       checkedAt: snapshot.checkedAt || null,
+      dateKey: snapshot.dateKey || getDateKey(snapshot.checkedAt || Date.now(), SCHEDULE_TIMEZONE),
+      itemKey: snapshot.itemKey || "",
+      productName: snapshot.productName || "",
+      productUrl: snapshot.productUrl || "",
+      storeName: snapshot.storeName || "",
+      image: snapshot.image || "",
+      price: snapshot.price || "",
       source: snapshot.source || "",
       slotKey: snapshot.slotKey || "",
       graphEligible: isSnapshotGraphEligible(snapshot),
@@ -3224,7 +3682,9 @@ function publicKeyword(keyword) {
     graphHistory: Array.isArray(keyword.graphHistory) ? keyword.graphHistory : [],
     lastChecked: keyword.lastChecked || null,
     lastError: keyword.lastError || "",
-    matchedBy: keyword.matchedBy || ""
+    matchedBy: keyword.matchedBy || "",
+    lastApiCalls: keyword.lastApiCalls || 0,
+    resultCount: keyword.resultCount || 0
   };
 }
 
@@ -3265,13 +3725,19 @@ function parseBulkProducts(body) {
 
 function normalizeBulkRow(row) {
   if (!row || typeof row !== "object") return null;
-  return {
+  const normalized = {
     url: String(row.url || row.productUrl || "").trim(),
     keywords: String(row.keywords || row.keyword || "").trim(),
     name: String(row.name || "").trim(),
     store: String(row.store || row.storeName || "").trim(),
-    productId: String(row.productId || "").trim()
+    productId: String(row.productId || "").trim(),
+    alertRanks: row.alertRanks || row.ranks || row.rankThresholds || "",
+    dropThreshold: row.dropThreshold || row.drop || row.fall || ""
   };
+  if (Array.isArray(row.keywordConfigs)) {
+    normalized.keywordConfigs = row.keywordConfigs;
+  }
+  return normalized;
 }
 
 function parseDelimitedLine(line, delimiter) {

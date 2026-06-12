@@ -36,16 +36,22 @@ const el = {
   closeModal: document.getElementById("closeModal"),
   cancelModal: document.getElementById("cancelModal"),
   productForm: document.getElementById("productForm"),
-  addKeywordRow: document.getElementById("addKeywordRow"),
-  keywordRows: document.getElementById("keywordRows"),
   productGrid: document.getElementById("productGrid"),
   emptyProducts: document.getElementById("emptyProducts"),
   productCount: document.getElementById("productCount"),
+  bulkSlotMeta: document.getElementById("bulkSlotMeta"),
+  bulkSlotList: document.getElementById("bulkSlotList"),
+  addBulkSlotsButton: document.getElementById("addBulkSlotsButton"),
+  compactBulkSlotsButton: document.getElementById("compactBulkSlotsButton"),
+  bulkPreviewButton: document.getElementById("bulkPreviewButton"),
+  bulkImportButton: document.getElementById("bulkImportButton"),
+  bulkResult: document.getElementById("bulkResult"),
   signalList: document.getElementById("signalList"),
   reportMeta: document.getElementById("reportMeta"),
   thresholdReport: document.getElementById("thresholdReport"),
   dropReport: document.getElementById("dropReport"),
   entryReport: document.getElementById("entryReport"),
+  rankChangeReport: document.getElementById("rankChangeReport"),
   kpiProducts: document.getElementById("kpiProducts"),
   kpiKeywords: document.getElementById("kpiKeywords"),
   kpiThreshold: document.getElementById("kpiThreshold"),
@@ -60,7 +66,7 @@ init();
 
 async function init() {
   bindEvents();
-  addKeywordRow();
+  addBulkSlots(5);
   try {
     state.config = await api("/api/config");
     const me = await api("/api/me");
@@ -105,14 +111,20 @@ function bindEvents() {
   el.productModal.addEventListener("click", (event) => {
     if (event.target === el.productModal) closeModal();
   });
-  el.addKeywordRow.addEventListener("click", addKeywordRow);
-  el.keywordRows.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-remove-keyword]");
-    if (!button) return;
-    button.closest(".keyword-row")?.remove();
-    if (!el.keywordRows.querySelector(".keyword-row")) addKeywordRow();
-  });
   el.productForm.addEventListener("submit", createProduct);
+  el.addBulkSlotsButton?.addEventListener("click", () => addBulkSlots(5));
+  el.compactBulkSlotsButton?.addEventListener("click", compactBulkSlots);
+  el.bulkPreviewButton?.addEventListener("click", previewBulkSlots);
+  el.bulkImportButton?.addEventListener("click", bulkImportSlots);
+  el.bulkSlotList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-bulk-slot]");
+    if (!button) return;
+    button.closest(".bulk-slot")?.remove();
+    if (!el.bulkSlotList.querySelector(".bulk-slot")) addBulkSlots(1);
+    renumberBulkSlots();
+    renderBulkMeta();
+  });
+  el.bulkSlotList?.addEventListener("input", renderBulkMeta);
 
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => setView(button.dataset.view));
@@ -246,11 +258,11 @@ function renderConfig() {
 }
 
 function renderKpis() {
-  const products = state.products || [];
-  const keywordCount = products.reduce((sum, product) => sum + (product.keywords || []).length, 0);
+  const keywords = state.products || [];
+  const latestItemCount = keywords.reduce((sum, product) => sum + Number(product.resultCount || product.latestItems?.length || 0), 0);
   const summary = state.report?.summary || {};
-  el.kpiProducts.textContent = products.length;
-  el.kpiKeywords.textContent = keywordCount;
+  el.kpiProducts.textContent = keywords.length;
+  el.kpiKeywords.textContent = latestItemCount;
   el.kpiThreshold.textContent = summary.thresholdDropCount || 0;
   el.kpiDrop.textContent = summary.rangeDropCount || 0;
   el.kpiEntry.textContent = summary.newEntryCount || 0;
@@ -261,33 +273,47 @@ function renderKpis() {
 
 function renderProducts() {
   const products = state.products || [];
-  el.productCount.textContent = `${products.length}개 상품`;
+  el.productCount.textContent = `${products.length}개 키워드`;
+  renderBulkMeta();
   el.emptyProducts.hidden = products.length > 0;
-  el.productGrid.innerHTML = products.map((product) => `
-    <article class="product-card">
-      <div class="product-head">
-        <div class="product-thumb">${product.image ? `<img src="${esc(product.image)}" alt="">` : `<svg><use href="#box"></use></svg>`}</div>
-        <div>
-          <strong>${esc(product.name || "상품 확인중")}</strong>
-          <span>${esc(product.store || "스토어 확인중")}</span>
-        </div>
-      </div>
-      <a class="product-url" href="${esc(product.url)}" target="_blank" rel="noreferrer">${esc(product.url || "")}</a>
-      <div class="keyword-list">
-        ${(product.keywords || []).map((keyword) => `
-          <div class="keyword-chip">
-            <span>${esc(keyword.term)}</span>
-            <strong>${keyword.rank ? `${keyword.rank}위` : "50위 밖"}</strong>
-            <small>기준 ${esc((keyword.alertRanks || [10]).join(", "))} / 하락 ${keyword.dropThreshold || 15}</small>
+  el.productGrid.innerHTML = products.map((product) => {
+    const keyword = (product.keywords || [])[0] || {};
+    const items = (product.latestItems || []).slice(0, 8);
+    return `
+      <article class="product-card keyword-card">
+        <div class="product-head">
+          <div class="product-thumb"><svg><use href="#chart"></use></svg></div>
+          <div>
+            <strong>${esc(product.term || product.name || keyword.term || "키워드")}</strong>
+            <span>기준 ${esc((product.alertRanks || keyword.alertRanks || [15]).join(", "))}위 / 하락폭 ${product.dropThreshold || keyword.dropThreshold || 10}위</span>
           </div>
-        `).join("")}
-      </div>
-      <div class="card-actions">
-        <button class="ghost" type="button" data-track-product="${esc(product.id)}"><svg><use href="#refresh"></use></svg><span>조회</span></button>
-        <button class="danger" type="button" data-delete-product="${esc(product.id)}"><svg><use href="#trash"></use></svg><span>삭제</span></button>
-      </div>
-    </article>
-  `).join("");
+        </div>
+        <div class="keyword-meta">
+          <span>최근수집 ${formatTime(product.lastCollectionAt || keyword.lastChecked)}</span>
+          <span>저장 ${product.collectionCount || 0}행</span>
+          <span>최신 ${product.resultCount || items.length || 0}개</span>
+        </div>
+        <div class="rank-table-wrap">
+          <table class="rank-table">
+            <thead><tr><th>순위</th><th>상품</th><th>스토어</th></tr></thead>
+            <tbody>
+              ${items.length ? items.map((item) => `
+                <tr>
+                  <td>${item.rank || "-"}</td>
+                  <td><a href="${esc(item.link || item.productUrl || "#")}" target="_blank" rel="noreferrer">${esc(item.title || item.productName || "-")}</a></td>
+                  <td>${esc(item.mallName || item.storeName || "-")}</td>
+                </tr>
+              `).join("") : `<tr><td colspan="3">아직 수집된 순위가 없습니다.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+        <div class="card-actions">
+          <button class="ghost" type="button" data-track-product="${esc(product.id)}"><svg><use href="#refresh"></use></svg><span>조회</span></button>
+          <button class="danger" type="button" data-delete-product="${esc(product.id)}"><svg><use href="#trash"></use></svg><span>삭제</span></button>
+        </div>
+      </article>
+    `;
+  }).join("");
   el.productGrid.querySelectorAll("[data-track-product]").forEach((button) => {
     button.addEventListener("click", () => trackProduct(button.dataset.trackProduct));
   });
@@ -297,23 +323,26 @@ function renderProducts() {
 }
 
 function renderReport() {
-  const report = state.report || { thresholdDrops: [], rangeDrops: [], newEntries: [] };
+  const report = state.report || { thresholdDrops: [], rangeDrops: [], newEntries: [], rankChanges: [] };
   const signals = [
     ...report.thresholdDrops.map((item) => ({ ...item, tone: "warn" })),
     ...report.rangeDrops.map((item) => ({ ...item, tone: "bad" })),
     ...report.newEntries.map((item) => ({ ...item, tone: "good" }))
   ].slice(0, 8);
-  el.signalList.innerHTML = signals.length ? signals.map(renderSignalItem).join("") : emptyBlock("감지된 신호가 없습니다.", "최근 7일 기준으로 조건에 걸린 상품·키워드가 없습니다.");
+  el.signalList.innerHTML = signals.length ? signals.map(renderSignalItem).join("") : emptyBlock("감지된 신호가 없습니다.", "최근 7일 기준으로 조건에 걸린 키워드 결과가 없습니다.");
   el.thresholdReport.innerHTML = report.thresholdDrops.length ? report.thresholdDrops.map(renderReportItem).join("") : emptyLine("기준밖 이탈 없음");
   el.dropReport.innerHTML = report.rangeDrops.length ? report.rangeDrops.map(renderReportItem).join("") : emptyLine("하락폭 감지 없음");
   el.entryReport.innerHTML = report.newEntries.length ? report.newEntries.map(renderReportItem).join("") : emptyLine("신규 진입 없음");
+  if (el.rankChangeReport) {
+    el.rankChangeReport.innerHTML = report.rankChanges?.length ? report.rankChanges.slice(0, 80).map(renderReportItem).join("") : emptyLine("순위 변동 없음");
+  }
 }
 
 function renderSignalItem(item) {
   return `
     <article class="signal-item ${esc(item.tone || "")}">
       <span>${esc(item.eventType)}</span>
-      <strong>${esc(item.keyword)} · ${esc(item.productName)}</strong>
+      <strong>${esc(item.keyword)} · ${esc(item.productName || "상품명 없음")}</strong>
       <p>${esc(item.detail)}</p>
     </article>
   `;
@@ -323,9 +352,9 @@ function renderReportItem(item) {
   return `
     <article class="report-item">
       <strong>${esc(item.keyword)}</strong>
-      <span>${esc(item.productName)}</span>
+      <span>${esc(item.productName || "상품명 없음")} / ${esc(item.storeName || "-")}</span>
       <p>${esc(item.detail)}</p>
-      <a href="${esc(item.productUrl)}" target="_blank" rel="noreferrer">상품 보기</a>
+      ${item.productUrl ? `<a href="${esc(item.productUrl)}" target="_blank" rel="noreferrer">상품 보기</a>` : ""}
     </article>
   `;
 }
@@ -343,9 +372,9 @@ function setView(view) {
   document.querySelectorAll(".view").forEach((section) => section.classList.toggle("active", section.id === `${state.activeView}View`));
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.activeView));
   const titles = {
-    dashboard: ["대시보드", "등록한 상품과 키워드의 최근 7일 순위 신호를 확인합니다."],
-    products: ["상품·키워드", "순댕이에서 새로 추적할 상품과 키워드를 관리합니다."],
-    report: ["7일 리포트", "엑셀 파일에 들어갈 감지 내역을 미리 확인합니다."]
+    dashboard: ["대시보드", "등록 키워드의 최근 7일 순위 신호를 확인합니다."],
+    products: ["키워드", "매일 1~50위 순위를 저장할 키워드를 관리합니다."],
+    report: ["7일 리포트", "키워드별 원본 순위와 변동 내역을 확인합니다."]
   };
   const [title, sub] = titles[state.activeView] || titles.dashboard;
   el.pageTitle.textContent = title;
@@ -354,65 +383,38 @@ function setView(view) {
 
 function openModal() {
   el.productForm.reset();
-  el.keywordRows.innerHTML = "";
-  addKeywordRow();
   el.productModal.hidden = false;
-  el.productForm.url.focus();
+  el.productForm.keyword.focus();
 }
 
 function closeModal() {
   el.productModal.hidden = true;
 }
 
-function addKeywordRow() {
-  const row = document.createElement("div");
-  row.className = "keyword-row";
-  row.innerHTML = `
-    <label>
-      키워드
-      <input name="keywordTerm" required placeholder="예: 여름 샌들">
-    </label>
-    <label>
-      기준 순위
-      <input name="alertRanks" placeholder="예: 3,10,20">
-    </label>
-    <label>
-      하락폭
-      <input name="dropThreshold" inputmode="numeric" placeholder="15">
-    </label>
-    <button class="icon-button danger" type="button" data-remove-keyword aria-label="키워드 삭제"><svg><use href="#trash"></use></svg></button>
-  `;
-  el.keywordRows.appendChild(row);
-}
-
 async function createProduct(event) {
   event.preventDefault();
   const form = new FormData(el.productForm);
-  const keywordConfigs = [...el.keywordRows.querySelectorAll(".keyword-row")].map((row) => ({
-    term: row.querySelector('[name="keywordTerm"]')?.value.trim() || "",
-    alertRanks: row.querySelector('[name="alertRanks"]')?.value.trim() || "10",
-    dropThreshold: row.querySelector('[name="dropThreshold"]')?.value.trim() || "15"
-  })).filter((item) => item.term);
-
-  if (!keywordConfigs.length) {
-    toast("키워드를 1개 이상 입력해 주세요.");
+  const keyword = String(form.get("keyword") || "").trim();
+  if (!keyword) {
+    toast("키워드를 입력해 주세요.");
     return;
   }
 
-  const payload = {
-    url: String(form.get("url") || "").trim(),
-    name: String(form.get("name") || "").trim(),
-    store: String(form.get("store") || "").trim(),
-    keywordConfigs
-  };
-
   setBusy(true);
   try {
-    await api("/api/products", { method: "POST", body: payload });
+    await api("/api/products", {
+      method: "POST",
+      body: {
+        keyword,
+        alertRanks: String(form.get("alertRanks") || "").trim() || "15",
+        dropThreshold: String(form.get("dropThreshold") || "").trim() || "10"
+      },
+      timeoutMs: 120000
+    });
     closeModal();
     await loadAll();
     render();
-    toast("상품과 키워드를 저장했습니다.");
+    toast("키워드와 1~50위 순위를 저장했습니다.");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -420,14 +422,198 @@ async function createProduct(event) {
   }
 }
 
+function addBulkSlots(count = 1) {
+  if (!el.bulkSlotList) return;
+  const amount = Math.max(1, Number(count) || 1);
+  for (let index = 0; index < amount; index += 1) {
+    const slot = document.createElement("article");
+    slot.className = "bulk-slot keyword-bulk-slot";
+    slot.innerHTML = `
+      <div class="bulk-slot-head">
+        <strong>슬롯 <span data-bulk-slot-number></span></strong>
+        <button class="icon-button danger" type="button" data-remove-bulk-slot aria-label="슬롯 삭제"><svg><use href="#trash"></use></svg></button>
+      </div>
+      <label class="bulk-keyword-field">
+        키워드
+        <input name="bulkKeyword" placeholder="예: 여름 샌들">
+      </label>
+      <label>
+        기준 순위
+        <input name="bulkAlertRanks" placeholder="15">
+      </label>
+      <label>
+        하락폭
+        <input name="bulkDropThreshold" inputmode="numeric" placeholder="10">
+      </label>
+    `;
+    el.bulkSlotList.appendChild(slot);
+  }
+  renumberBulkSlots();
+  renderBulkMeta();
+}
+
+function compactBulkSlots() {
+  if (!el.bulkSlotList) return;
+  el.bulkSlotList.querySelectorAll(".bulk-slot").forEach((slot) => {
+    const row = readBulkSlot(slot, 0);
+    if (row.empty) slot.remove();
+  });
+  if (!el.bulkSlotList.querySelector(".bulk-slot")) addBulkSlots(5);
+  renumberBulkSlots();
+  renderBulkMeta();
+  if (el.bulkResult) el.bulkResult.hidden = true;
+}
+
+function renumberBulkSlots() {
+  el.bulkSlotList?.querySelectorAll(".bulk-slot").forEach((slot, index) => {
+    const number = slot.querySelector("[data-bulk-slot-number]");
+    if (number) number.textContent = String(index + 1);
+  });
+}
+
+function renderBulkMeta() {
+  if (!el.bulkSlotMeta || !el.bulkSlotList) return;
+  const totalSlots = el.bulkSlotList.querySelectorAll(".bulk-slot").length;
+  const usedSlots = collectBulkSlots({ includeInvalid: true }).length;
+  const productLimit = state.config.productLimit || 100;
+  const currentCount = (state.products || []).length;
+  el.bulkSlotMeta.textContent = `사용중 ${usedSlots}칸 / 전체 ${totalSlots}칸 · 키워드 ${currentCount}/${productLimit}`;
+}
+
+function collectBulkSlots(options = {}) {
+  if (!el.bulkSlotList) return [];
+  return [...el.bulkSlotList.querySelectorAll(".bulk-slot")]
+    .map((slot, index) => readBulkSlot(slot, index + 1))
+    .filter((row) => options.includeInvalid ? !row.empty : row.valid);
+}
+
+function readBulkSlot(slot, number) {
+  const term = slot.querySelector('[name="bulkKeyword"]')?.value.trim() || "";
+  const alertRanksRaw = slot.querySelector('[name="bulkAlertRanks"]')?.value.trim() || "";
+  const dropThresholdRaw = slot.querySelector('[name="bulkDropThreshold"]')?.value.trim() || "";
+  const empty = !term && !alertRanksRaw && !dropThresholdRaw;
+  return {
+    slot: number,
+    term,
+    alertRanks: alertRanksRaw || "15",
+    dropThreshold: dropThresholdRaw || "10",
+    empty,
+    valid: Boolean(term),
+    message: term ? "등록 가능" : "키워드 필요"
+  };
+}
+
+function previewBulkSlots() {
+  const rows = collectBulkSlots({ includeInvalid: true });
+  if (!el.bulkResult) return;
+  if (!rows.length) {
+    el.bulkResult.hidden = false;
+    el.bulkResult.innerHTML = `<strong>미리보기</strong><span>채워진 슬롯이 없습니다.</span>`;
+    return;
+  }
+
+  const currentCount = (state.products || []).length;
+  const productLimit = state.config.productLimit || 100;
+  const remaining = Math.max(0, productLimit - currentCount);
+  const validRows = rows.filter((row) => row.valid);
+
+  el.bulkResult.hidden = false;
+  el.bulkResult.innerHTML = `
+    <strong>슬롯 미리보기 · 등록 가능 ${Math.min(validRows.length, remaining)}개 · 확인필요 ${rows.length - validRows.length + Math.max(0, validRows.length - remaining)}개</strong>
+    <div class="bulk-preview-meta">
+      <span>현재 ${currentCount}개 / 한도 ${productLimit}개</span>
+      <span>남은 슬롯 ${remaining}개</span>
+    </div>
+    <div class="bulk-preview-table-wrap">
+      <table class="bulk-preview-table">
+        <thead><tr><th>슬롯</th><th>키워드</th><th>기준순위</th><th>하락폭</th><th>상태</th></tr></thead>
+        <tbody>
+          ${rows.map((row) => {
+            const validIndex = validRows.indexOf(row) + 1;
+            const overLimit = row.valid && validIndex > remaining;
+            const status = overLimit ? "한도 초과 예정" : row.message;
+            return `
+              <tr class="${row.valid && !overLimit ? "ok" : "warn"}">
+                <td>${row.slot}</td>
+                <td>${esc(row.term || "-")}</td>
+                <td>${esc(row.alertRanks)}</td>
+                <td>${esc(row.dropThreshold)}</td>
+                <td>${esc(status)}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function bulkImportSlots() {
+  const rows = collectBulkSlots({ includeInvalid: true });
+  const validRows = rows.filter((row) => row.valid);
+  const invalidRows = rows.filter((row) => !row.valid);
+
+  if (!validRows.length) {
+    toast("등록 가능한 키워드 슬롯이 없습니다.");
+    previewBulkSlots();
+    return;
+  }
+
+  if (validRows.length > 30) {
+    toast("대량 등록은 한 번에 최대 30개까지 가능합니다.");
+    return;
+  }
+
+  if (invalidRows.length && !confirm(`확인필요 슬롯 ${invalidRows.length}개를 제외하고 등록할까요?`)) {
+    return;
+  }
+
+  setBusy(true);
+  try {
+    const result = await api("/api/products/bulk", {
+      method: "POST",
+      body: {
+        rows: validRows.map((row) => ({
+          term: row.term,
+          alertRanks: row.alertRanks,
+          dropThreshold: row.dropThreshold
+        }))
+      },
+      timeoutMs: 180000
+    });
+    await loadAll();
+    render();
+    renderBulkResult(result);
+    toast(`${result.createdCount || 0}개 키워드를 등록했습니다.`);
+  } catch (error) {
+    if (el.bulkResult) {
+      el.bulkResult.hidden = false;
+      el.bulkResult.innerHTML = `<strong>등록 실패</strong><span>${esc(error.message)}</span>`;
+    }
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderBulkResult(result) {
+  if (!el.bulkResult) return;
+  const errors = result.errors || [];
+  el.bulkResult.hidden = false;
+  el.bulkResult.innerHTML = `
+    <strong>등록 ${result.createdCount || 0}개 완료 · 확인필요 ${errors.length}개</strong>
+    ${errors.length ? `<ul>${errors.slice(0, 10).map((error) => `<li>${error.row}번: ${esc(error.message)}</li>`).join("")}</ul>` : "<span>모든 키워드가 등록되었습니다.</span>"}
+  `;
+}
+
 async function trackAll() {
   setBusy(true);
   try {
-    const result = await api("/api/track-all", { method: "POST" });
+    const result = await api("/api/track-all", { method: "POST", timeoutMs: 180000 });
     state.products = result.products || [];
     await loadReport();
     render();
-    toast("전체 순위를 다시 확인했습니다.");
+    toast("전체 키워드 순위를 다시 수집했습니다.");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -438,10 +624,10 @@ async function trackAll() {
 async function trackProduct(productId) {
   setBusy(true);
   try {
-    await api(`/api/products/${encodeURIComponent(productId)}/track`, { method: "POST" });
+    await api(`/api/products/${encodeURIComponent(productId)}/track`, { method: "POST", timeoutMs: 120000 });
     await loadAll();
     render();
-    toast("상품 순위를 다시 확인했습니다.");
+    toast("키워드 순위를 다시 수집했습니다.");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -450,7 +636,7 @@ async function trackProduct(productId) {
 }
 
 async function deleteProduct(productId) {
-  if (!confirm("이 상품을 삭제할까요?")) return;
+  if (!confirm("이 키워드를 삭제할까요? 저장된 7일 순위도 함께 삭제됩니다.")) return;
   setBusy(true);
   try {
     await api(`/api/products/${encodeURIComponent(productId)}`, { method: "DELETE" });

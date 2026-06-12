@@ -100,7 +100,7 @@
       </div>
       <nav class="nav">
         <button class="active" data-view="dashboard" type="button"><svg><use href="#chart"></use></svg><span>대시보드</span></button>
-        <button data-view="products" type="button"><svg><use href="#box"></use></svg><span>상품·키워드</span></button>
+        <button data-view="products" type="button"><svg><use href="#box"></use></svg><span>키워드</span></button>
         <button data-view="report" type="button"><svg><use href="#bell"></use></svg><span>7일 리포트</span></button>
       </nav>
       <div class="side-status">
@@ -127,8 +127,8 @@
 
       <section id="dashboardView" class="view active">
         <div class="kpis">
-          <article><span>상품</span><strong id="kpiProducts">0</strong><em>등록 상품</em></article>
-          <article><span>키워드</span><strong id="kpiKeywords">0</strong><em>추적 키워드</em></article>
+          <article><span>키워드</span><strong id="kpiProducts">0</strong><em>등록 키워드</em></article>
+          <article><span>수집상품</span><strong id="kpiKeywords">0</strong><em>최신 50위 합계</em></article>
           <article><span>기준밖</span><strong id="kpiThreshold">0</strong><em>7일 감지</em></article>
           <article><span>하락폭</span><strong id="kpiDrop">0</strong><em>지정값 이상</em></article>
           <article><span>신규진입</span><strong id="kpiEntry">0</strong><em>50위 안 진입</em></article>
@@ -145,18 +145,35 @@
       </section>
 
       <section id="productsView" class="view">
+        <section class="panel bulk-panel">
+          <div class="panel-head">
+            <div>
+              <h3>키워드 대량 등록 슬롯</h3>
+              <small id="bulkSlotMeta">키워드만 입력합니다. 기본 기준순위 15위, 하락폭 10위입니다.</small>
+            </div>
+            <div class="bulk-actions">
+              <button class="ghost" id="addBulkSlotsButton" type="button"><svg><use href="#plus"></use></svg><span>슬롯 추가</span></button>
+              <button class="ghost" id="compactBulkSlotsButton" type="button">빈 슬롯 정리</button>
+              <button class="ghost" id="bulkPreviewButton" type="button">미리보기</button>
+              <button class="primary" id="bulkImportButton" type="button"><svg><use href="#check"></use></svg><span>등록 실행</span></button>
+            </div>
+          </div>
+          <div id="bulkSlotList" class="bulk-slot-list"></div>
+          <div id="bulkResult" class="bulk-result" hidden></div>
+        </section>
+
         <section class="panel">
           <div class="panel-head">
             <div>
-              <h3>상품·키워드</h3>
-              <small id="productCount">0개 상품</small>
+              <h3>등록 키워드</h3>
+              <small id="productCount">0개 키워드</small>
             </div>
-            <button class="primary" data-open-product type="button"><svg><use href="#plus"></use></svg><span>상품 등록</span></button>
+            <button class="primary" data-open-product type="button"><svg><use href="#plus"></use></svg><span>키워드 등록</span></button>
           </div>
           <div id="productGrid" class="product-grid"></div>
           <div id="emptyProducts" class="empty" hidden>
-            <strong>등록된 상품이 없습니다.</strong>
-            <span>순댕이에서 사용할 상품과 키워드를 새로 등록해 주세요.</span>
+            <strong>등록된 키워드가 없습니다.</strong>
+            <span>매일 1~50위 순위를 저장할 키워드를 등록해 주세요.</span>
           </div>
         </section>
       </section>
@@ -166,7 +183,7 @@
           <div class="panel-head">
             <div>
               <h3>7일 리포트</h3>
-              <small>기준밖 이탈, 하락폭, 신규진입을 분리해서 봅니다.</small>
+              <small>키워드별 1~50위 원본과 7일 변동을 봅니다.</small>
             </div>
             <button class="ghost" id="reportDownloadButton" type="button"><svg><use href="#download"></use></svg><span>엑셀</span></button>
           </div>
@@ -184,6 +201,10 @@
               <div id="entryReport" class="report-list"></div>
             </div>
           </div>
+          <div class="rank-change-wrap">
+            <h4>순위 상승·하락</h4>
+            <div id="rankChangeReport" class="report-list wide"></div>
+          </div>
         </section>
       </section>
     </main>
@@ -193,30 +214,28 @@
     <div class="modal">
       <div class="panel-head">
         <div>
-          <h3>상품 등록</h3>
-          <small>상품 URL과 키워드별 기준을 순댕이에 새로 저장합니다.</small>
+          <h3>키워드 등록</h3>
+          <small>등록 즉시 네이버 쇼핑 1~50위 결과를 저장합니다.</small>
         </div>
         <button class="icon-button" id="closeModal" type="button" aria-label="닫기"><svg><use href="#close"></use></svg></button>
       </div>
       <form id="productForm" class="product-form">
         <label>
-          상품 URL
-          <input name="url" type="url" required placeholder="https://smartstore.naver.com/...">
+          키워드
+          <input name="keyword" required placeholder="예: 여름 샌들">
         </label>
         <div class="two-col">
           <label>
-            상품명
-            <input name="name" placeholder="비워두면 자동 확인">
+            기준 순위
+            <input name="alertRanks" placeholder="15">
           </label>
           <label>
-            스토어명
-            <input name="store" placeholder="비워두면 자동 확인">
+            하락폭
+            <input name="dropThreshold" inputmode="numeric" placeholder="10">
           </label>
         </div>
-        <div class="keyword-head">
-          <strong>키워드 설정</strong>
-          <button class="ghost" id="addKeywordRow" type="button"><svg><use href="#plus"></use></svg><span>키워드</span></button>
-        </div>
+        <p class="form-note">기준 순위는 최대 3개까지 입력할 수 있습니다. 예: 5, 10, 15</p>
+        <button id="addKeywordRow" type="button" hidden></button>
         <div id="keywordRows" class="keyword-rows"></div>
         <div class="modal-actions">
           <button class="ghost" id="cancelModal" type="button">취소</button>
