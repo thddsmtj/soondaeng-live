@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: soondaeng-live
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: NAVER_CLIENT_ID
+        sync: false
+      - key: NAVER_CLIENT_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STATE_TABLE
+        value: soondaeng_state
+      - key: SESSION_SECRET
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+      - key: FREE_PRODUCT_LIMIT
+        value: "100"
+      - key: SCHEDULE_TIMEZONE
+        value: Asia/Seoul
+      - key: SCHEDULE_TIMES
+        value: "08:00"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: REPORT_FROM
+        sync: false
+      - key: REPORT_RECIPIENTS
+        sync: false
