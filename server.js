@@ -945,6 +945,8 @@ function buildAdminOverview(db, snapshotLimit) {
   const todayKey = getDateKey(Date.now(), SCHEDULE_TIMEZONE);
   const apiCallsByUser = new Map();
   const todayApiCallsByUser = new Map();
+  const estimatedCollectionsByUser = new Map();
+  const estimatedTodayCollectionsByUser = new Map();
 
   for (const product of products) {
     if (!productsByUser.has(product.userId)) productsByUser.set(product.userId, []);
@@ -970,9 +972,28 @@ function buildAdminOverview(db, snapshotLimit) {
         todayApiCallsByUser.set(snapshot.userId, Number(todayApiCallsByUser.get(snapshot.userId) || 0) + apiCalls);
       }
     }
+    if (!apiCalls && snapshot.userId && snapshot.productId && snapshot.status === "completed") {
+      const dayKey = getDateKey(snapshot.checkedAt || Date.now(), SCHEDULE_TIMEZONE);
+      const collectionKey = snapshot.collectionId || `${snapshot.productId}:${dayKey}:${snapshot.checkedAt || ""}`;
+      const userCollections = estimatedCollectionsByUser.get(snapshot.userId) || new Set();
+      userCollections.add(collectionKey);
+      estimatedCollectionsByUser.set(snapshot.userId, userCollections);
+      if (dayKey === todayKey) {
+        const todayCollections = estimatedTodayCollectionsByUser.get(snapshot.userId) || new Set();
+        todayCollections.add(collectionKey);
+        estimatedTodayCollectionsByUser.set(snapshot.userId, todayCollections);
+      }
+    }
   }
 
-  const apiUsageSummary = getApiUsageSummary(db);
+  for (const [userId, collections] of estimatedCollectionsByUser.entries()) {
+    apiCallsByUser.set(userId, Number(apiCallsByUser.get(userId) || 0) + collections.size);
+  }
+  for (const [userId, collections] of estimatedTodayCollectionsByUser.entries()) {
+    todayApiCallsByUser.set(userId, Number(todayApiCallsByUser.get(userId) || 0) + collections.size);
+  }
+
+  const apiUsageSummary = getApiUsageSummary(db, snapshots);
   const usageByUser = users.map((user) => ({
     userId: user.id,
     email: user.email || "",
@@ -2920,23 +2941,45 @@ function addApiUsage(db, calls, timestamp) {
   db.meta.apiUsage.days = Object.fromEntries(entries.slice(0, 60));
 }
 
-function getApiUsageSummary(db) {
+function getApiUsageSummary(db, snapshotsForEstimate = []) {
   const usage = db.meta?.apiUsage || { days: {}, total: 0 };
+  const estimatedDays = estimateApiUsageFromSnapshots(snapshotsForEstimate);
+  const mergedDays = { ...(usage.days || {}) };
+  for (const [day, count] of Object.entries(estimatedDays.days)) {
+    mergedDays[day] = Math.max(Number(mergedDays[day] || 0), Number(count || 0));
+  }
+  const estimatedTotal = Object.values(estimatedDays.days).reduce((sum, count) => sum + Number(count || 0), 0);
+  const total = Math.max(Number(usage.total || 0), estimatedTotal);
   const today = getDateKey(Date.now(), SCHEDULE_TIMEZONE);
   const yesterday = getDateKey(Date.now() - 86400000, SCHEDULE_TIMEZONE);
-  const dayEntries = Object.entries(usage.days || {})
+  const dayEntries = Object.entries(mergedDays)
     .sort((a, b) => b[0].localeCompare(a[0]))
     .map(([day, count]) => ({ day, count: Number(count || 0) }));
   return {
     today,
-    todayCount: Number(usage.days?.[today] || 0),
-    yesterdayCount: Number(usage.days?.[yesterday] || 0),
-    total: Number(usage.total || 0),
+    todayCount: Number(mergedDays[today] || 0),
+    yesterdayCount: Number(mergedDays[yesterday] || 0),
+    total,
     limit: 25000,
-    remainingToday: Math.max(0, 25000 - Number(usage.days?.[today] || 0)),
-    days: usage.days || {},
+    remainingToday: Math.max(0, 25000 - Number(mergedDays[today] || 0)),
+    days: mergedDays,
     recentDays: dayEntries.slice(0, 7),
     updatedAt: usage.updatedAt || null
+  };
+}
+
+function estimateApiUsageFromSnapshots(snapshots = []) {
+  const byDay = new Map();
+  for (const snapshot of snapshots || []) {
+    if (Number(snapshot.apiCalls || 0) > 0) continue;
+    if (snapshot.status !== "completed" || !snapshot.productId || !snapshot.checkedAt) continue;
+    const day = getDateKey(snapshot.checkedAt, SCHEDULE_TIMEZONE);
+    const collectionKey = snapshot.collectionId || `${snapshot.userId || ""}:${snapshot.productId}:${day}:${snapshot.checkedAt}`;
+    if (!byDay.has(day)) byDay.set(day, new Set());
+    byDay.get(day).add(collectionKey);
+  }
+  return {
+    days: Object.fromEntries([...byDay.entries()].map(([day, set]) => [day, set.size]))
   };
 }
 
