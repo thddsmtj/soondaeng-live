@@ -33,6 +33,9 @@ const SCHEDULE_TIMES = parseScheduleTimes(process.env.SCHEDULE_TIMES || "08:00")
 const REPORT_RECIPIENTS = splitRecipients(process.env.REPORT_RECIPIENTS || "");
 const REPORT_FROM = process.env.REPORT_FROM || process.env.EMAIL_FROM || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const ADMIN_APP_URL = trimTrailingSlash(process.env.ADMIN_APP_URL || "https://soondaeng-admin.onrender.com");
+const SUPABASE_TIMEOUT_MS = clamp(Number(process.env.SUPABASE_TIMEOUT_MS || 15000), 3000, 60000);
+const SUPABASE_RETRY_COUNT = clamp(Number(process.env.SUPABASE_RETRY_COUNT || 3), 1, 5);
 let scheduledTrackingRunning = false;
 
 const mimeTypes = {
@@ -213,7 +216,33 @@ async function supabaseFetch(pathname, options = {}) {
     init.body = JSON.stringify(options.body);
   }
 
-  return fetch(`${SUPABASE_URL}/rest/v1${pathname}`, init);
+  const attempts = options.retries || SUPABASE_RETRY_COUNT;
+  let lastError = null;
+  let lastResponse = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SUPABASE_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${SUPABASE_URL}/rest/v1${pathname}`, {
+        ...init,
+        signal: controller.signal
+      });
+      if (!isTransientStatus(response.status) || attempt === attempts) return response;
+      lastResponse = response;
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts) break;
+    } finally {
+      clearTimeout(timeout);
+    }
+    await sleep(350 * attempt);
+  }
+
+  if (lastResponse) return lastResponse;
+  const error = new Error(`Supabase request failed: ${lastError?.message || "unknown"}`);
+  error.publicMessage = "Supabase 연결이 잠시 불안정합니다. 잠시 뒤 다시 시도해 주세요.";
+  throw error;
 }
 
 async function throwSupabaseError(response, fallbackMessage) {
@@ -425,13 +454,14 @@ async function registerUser(req, res, body) {
 async function loginUser(req, res, body) {
   const phone = normalizePhone(body.phone);
   const password = String(body.password || "");
-  const db = await readDb();
-  const user = db.users.find((item) => normalizePhone(item.phone) === phone);
 
   if (!isValidPhone(phone)) {
     sendJson(res, 400, { error: "INVALID_PHONE", message: "전화번호는 010으로 시작하는 숫자 11자리로 입력해 주세요. 예: 01012345678" });
     return;
   }
+
+  const db = await readDb();
+  const user = db.users.find((item) => normalizePhone(item.phone) === phone);
 
   if (!user || !verifyPassword(password, user.passwordHash)) {
     sendJson(res, 401, { error: "BAD_LOGIN", message: "전화번호 또는 비밀번호가 맞지 않습니다." });
@@ -2995,8 +3025,15 @@ function wordOverlap(a, b) {
 
 async function serveStatic(req, res, requestUrl) {
   const rawPath = decodeURIComponent(requestUrl.pathname);
+  if (rawPath === "/favicon.ico") {
+    res.writeHead(204, { "Cache-Control": "public, max-age=86400" });
+    res.end();
+    return;
+  }
+
   if (rawPath === "/admin" || rawPath.startsWith("/admin/")) {
-    sendText(res, 404, "Not found");
+    res.writeHead(302, { Location: ADMIN_APP_URL, "Cache-Control": "no-store" });
+    res.end();
     return;
   }
 
@@ -3306,6 +3343,14 @@ function sendText(res, statusCode, body) {
     "Content-Length": Buffer.byteLength(body)
   });
   res.end(body);
+}
+
+function isTransientStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function uid() {

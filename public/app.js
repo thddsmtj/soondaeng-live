@@ -65,8 +65,13 @@ async function init() {
     state.config = await api("/api/config");
     const me = await api("/api/me");
     state.user = me.user;
-    await loadAll();
     showApp();
+    try {
+      await loadAll();
+      render();
+    } catch (error) {
+      toast(`로그인 상태는 확인됐지만 데이터 갱신이 늦고 있습니다. 새로고침을 눌러 주세요. ${error.message}`);
+    }
   } catch {
     showAuth();
   }
@@ -165,17 +170,22 @@ async function handleAuth(event) {
   setBusy(true);
   try {
     const endpoint = state.authMode === "register" ? "/api/auth/register" : "/api/auth/login";
-    const result = await api(endpoint, { method: "POST", body: payload });
+    const result = await api(endpoint, { method: "POST", body: payload, retries: state.authMode === "login" ? 2 : 0, timeoutMs: 45000 });
     if (result.approvalPending) {
-      showAuthMessage(result.message || "승인 신청이 접수되었습니다.");
       state.authMode = "login";
       document.querySelectorAll("[data-auth-tab]").forEach((button) => button.classList.toggle("active", button.dataset.authTab === "login"));
       syncAuthMode();
+      showAuthMessage(result.message || "승인 신청이 접수되었습니다.");
       return;
     }
     state.user = result.user;
-    await loadAll();
     showApp();
+    try {
+      await loadAll();
+      render();
+    } catch (error) {
+      toast(`로그인은 됐지만 데이터 갱신이 늦고 있습니다. 새로고침을 눌러 주세요. ${error.message}`);
+    }
     toast("로그인했습니다.");
   } catch (error) {
     showAuthMessage(error.message);
@@ -459,21 +469,74 @@ function downloadReport() {
 }
 
 async function api(path, options = {}) {
+  const method = options.method || "GET";
   const init = {
-    method: options.method || "GET",
+    method,
     headers: { Accept: "application/json" }
   };
   if (options.body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(options.body);
   }
-  const response = await fetch(path, init);
-  const contentType = response.headers.get("content-type") || "";
-  const body = contentType.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok) {
-    throw new Error(body?.message || body?.error || "요청 처리 중 오류가 발생했습니다.");
+
+  const retries = Number.isInteger(options.retries) ? options.retries : (method === "GET" ? 2 : 0);
+  const timeoutMs = options.timeoutMs || 30000;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    let response;
+    try {
+      response = await fetchWithTimeout(path, init, timeoutMs);
+    } catch {
+      if (attempt < retries) {
+        await sleep(600 * (attempt + 1));
+        continue;
+      }
+      throw new Error("서버 연결이 잠시 불안정합니다. Render 배포 또는 절전 해제 중일 수 있으니 20~30초 뒤 다시 시도해 주세요.");
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const body = contentType.includes("application/json") ? await response.json().catch(() => ({})) : await response.text().catch(() => "");
+    if (response.ok) return body;
+    if (isRetryableStatus(response.status) && attempt < retries) {
+      await sleep(700 * (attempt + 1));
+      continue;
+    }
+    throw new Error(readableApiError(response, body, "요청 처리 중 오류가 발생했습니다."));
   }
-  return body;
+
+  throw new Error("요청 처리 중 오류가 발생했습니다.");
+}
+
+function readableApiError(response, body, fallback) {
+  const rawMessage = typeof body === "string" ? body : body?.message || body?.error || "";
+  const message = String(rawMessage || "").trim();
+  if (response.status === 401) return message || "로그인이 필요합니다. 다시 로그인해 주세요.";
+  if (response.status === 403) return message || "권한이 없습니다. 관리자 승인 상태를 확인해 주세요.";
+  if (response.status === 404 || /not\s*found/i.test(message)) {
+    return "페이지 또는 API 경로를 찾지 못했습니다. 배포가 끝난 뒤 Ctrl+F5로 새로고침해 주세요.";
+  }
+  if (response.status === 502 || response.status === 503 || response.status === 504) {
+    return "서버가 잠시 깨어나는 중입니다. Render 무료 서버는 처음 접속 때 늦을 수 있어 20~30초 뒤 다시 눌러 주세요.";
+  }
+  return message || `${fallback} (${response.status})`;
+}
+
+async function fetchWithTimeout(path, init, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(path, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function setBusy(value) {
@@ -500,7 +563,7 @@ function toast(message) {
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => {
     el.toast.hidden = true;
-  }, 2600);
+  }, 5600);
 }
 
 function formatTime(timestamp) {
