@@ -123,6 +123,7 @@
           <span id="keyStatus" class="pill muted">API 확인중</span>
           <span id="storageStatus" class="pill muted">저장소 확인중</span>
           <button class="ghost" id="exportButton" type="button" title="엑셀 다운로드" aria-label="엑셀 다운로드"><svg><use href="#download"></use></svg></button>
+          <button class="ghost" id="sendReportButton" type="button"><svg><use href="#mail"></use></svg><span>메일 발송</span></button>
           <button class="ghost" id="trackAllButton" type="button"><svg><use href="#refresh"></use></svg><span>전체조회</span></button>
           <button class="primary" id="openProductModal" type="button"><svg><use href="#plus"></use></svg><span>등록</span></button>
         </div>
@@ -199,7 +200,10 @@
               <h3>7일 리포트</h3>
               <small>키워드별 1~50위 원본과 7일 변동을 봅니다.</small>
             </div>
-            <button class="ghost" id="reportDownloadButton" type="button"><svg><use href="#download"></use></svg><span>엑셀</span></button>
+            <div class="report-actions">
+              <button class="ghost" id="reportSendButton" type="button"><svg><use href="#mail"></use></svg><span>메일 발송</span></button>
+              <button class="ghost" id="reportDownloadButton" type="button"><svg><use href="#download"></use></svg><span>엑셀</span></button>
+            </div>
           </div>
           <div class="report-columns">
             <div>

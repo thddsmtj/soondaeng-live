@@ -353,6 +353,11 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (method === "POST" && requestUrl.pathname === "/api/report/send") {
+    await sendUserReportRoute(req, res, auth.user);
+    return;
+  }
+
   if (method === "GET" && requestUrl.pathname === "/api/history") {
     const db = await readDb();
     sendJson(res, 200, buildUserHistory(db, auth.user.id, requestUrl));
@@ -1791,6 +1796,53 @@ async function createAndSendRankReport(db, slotKey, source) {
   db.meta.reports.unshift(stored);
   db.meta.reports = db.meta.reports.slice(0, 90);
   return stored;
+}
+
+async function sendUserReportRoute(req, res, user) {
+  if (!isValidEmail(user.email || "")) {
+    sendJson(res, 400, { error: "INVALID_EMAIL", message: "회원 이메일이 올바르지 않습니다. 내 정보에서 이메일을 수정해 주세요." });
+    return;
+  }
+
+  const db = await readDb();
+  const report = buildRankReport(db, { userId: user.id });
+  if (!report.summary.keywordCount) {
+    sendJson(res, 400, { error: "NO_KEYWORDS", message: "등록된 키워드가 없어 메일로 보낼 리포트가 없습니다." });
+    return;
+  }
+
+  const workbook = buildRankReportWorkbook(report);
+  const email = await sendRankReportEmail(report, workbook, [user.email], {
+    user,
+    subject: `[순댕이] ${getDateKey(report.generatedAt, SCHEDULE_TIMEZONE)} 내 키워드 순위 리포트`
+  }).catch((error) => ({
+    status: "error",
+    message: error.publicMessage || error.message || "이메일 발송 중 오류가 발생했습니다."
+  }));
+
+  const latestDb = await readDb();
+  latestDb.meta = latestDb.meta || {};
+  latestDb.meta.userReportEmails = Array.isArray(latestDb.meta.userReportEmails) ? latestDb.meta.userReportEmails : [];
+  latestDb.meta.userReportEmails.unshift({
+    id: uid(),
+    userId: user.id,
+    email: user.email,
+    createdAt: Date.now(),
+    status: email.status,
+    message: email.message || "",
+    summary: report.summary
+  });
+  latestDb.meta.userReportEmails = latestDb.meta.userReportEmails.slice(0, 300);
+  await writeDb(latestDb);
+
+  sendJson(res, 200, {
+    ok: email.status === "sent",
+    email,
+    summary: report.summary,
+    message: email.status === "sent"
+      ? `${user.email}로 리포트를 발송했습니다.`
+      : email.message || "이메일 발송 설정을 확인해 주세요."
+  });
 }
 
 async function sendMemberRankReportEmails(db) {

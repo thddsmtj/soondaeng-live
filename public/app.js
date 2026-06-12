@@ -32,7 +32,9 @@ const el = {
   scheduleStatus: document.getElementById("scheduleStatus"),
   trackAllButton: document.getElementById("trackAllButton"),
   exportButton: document.getElementById("exportButton"),
+  sendReportButton: document.getElementById("sendReportButton"),
   reportDownloadButton: document.getElementById("reportDownloadButton"),
+  reportSendButton: document.getElementById("reportSendButton"),
   openProductModal: document.getElementById("openProductModal"),
   productModal: document.getElementById("productModal"),
   closeModal: document.getElementById("closeModal"),
@@ -112,7 +114,9 @@ function bindEvents() {
   el.logoutButton.addEventListener("click", logout);
   el.trackAllButton.addEventListener("click", trackAll);
   el.exportButton.addEventListener("click", downloadReport);
+  el.sendReportButton?.addEventListener("click", sendReportEmail);
   el.reportDownloadButton.addEventListener("click", downloadReport);
+  el.reportSendButton?.addEventListener("click", sendReportEmail);
   el.openProductModal.addEventListener("click", openModal);
   document.querySelectorAll("[data-open-product]").forEach((button) => button.addEventListener("click", openModal));
   el.closeModal.addEventListener("click", closeModal);
@@ -823,6 +827,22 @@ async function deleteProduct(productId) {
 
 function downloadReport() {
   window.location.href = "/api/report/export";
+}
+
+async function sendReportEmail() {
+  if (!state.user?.email) {
+    toast("회원 이메일이 없어 발송할 수 없습니다. 내 정보에서 이메일을 확인해 주세요.");
+    return;
+  }
+  setBusy(true);
+  try {
+    const result = await api("/api/report/send", { method: "POST", timeoutMs: 60000 });
+    toast(result.message || (result.email?.status === "sent" ? "리포트 메일을 발송했습니다." : "메일 발송 설정을 확인해 주세요."));
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function api(path, options = {}) {
