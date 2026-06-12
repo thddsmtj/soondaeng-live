@@ -9,6 +9,8 @@ const state = {
   },
   products: [],
   report: null,
+  notices: [],
+  noticesOpen: localStorage.getItem("soondaeng_notices_open") !== "false",
   authMode: "login",
   activeView: "dashboard",
   busy: false
@@ -52,6 +54,13 @@ const el = {
   dropReport: document.getElementById("dropReport"),
   entryReport: document.getElementById("entryReport"),
   rankChangeReport: document.getElementById("rankChangeReport"),
+  noticeDock: document.getElementById("noticeDock"),
+  noticeDockMeta: document.getElementById("noticeDockMeta"),
+  noticeDockList: document.getElementById("noticeDockList"),
+  noticeList: document.getElementById("noticeList"),
+  closeNoticeDock: document.getElementById("closeNoticeDock"),
+  openNoticeDock: document.getElementById("openNoticeDock"),
+  profileForm: document.getElementById("profileForm"),
   kpiProducts: document.getElementById("kpiProducts"),
   kpiKeywords: document.getElementById("kpiKeywords"),
   kpiThreshold: document.getElementById("kpiThreshold"),
@@ -125,9 +134,33 @@ function bindEvents() {
     renderBulkMeta();
   });
   el.bulkSlotList?.addEventListener("input", renderBulkMeta);
+  el.closeNoticeDock?.addEventListener("click", () => {
+    state.noticesOpen = false;
+    localStorage.setItem("soondaeng_notices_open", "false");
+    renderNotices();
+  });
+  el.openNoticeDock?.addEventListener("click", () => {
+    state.noticesOpen = true;
+    localStorage.setItem("soondaeng_notices_open", "true");
+    renderNotices();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  el.noticeList?.addEventListener("submit", submitNoticeComment);
+  el.noticeDockList?.addEventListener("submit", submitNoticeComment);
+  el.profileForm?.addEventListener("submit", saveProfile);
+  const profilePhoneInput = el.profileForm?.querySelector('[name="phone"]');
+  profilePhoneInput?.addEventListener("input", () => {
+    profilePhoneInput.value = profilePhoneInput.value.replace(/\D+/g, "").slice(0, 11);
+  });
 
   document.querySelectorAll("[data-view]").forEach((button) => {
-    button.addEventListener("click", () => setView(button.dataset.view));
+    button.addEventListener("click", () => {
+      if (button.dataset.view === "notices") {
+        state.noticesOpen = true;
+        localStorage.setItem("soondaeng_notices_open", "true");
+      }
+      setView(button.dataset.view);
+    });
   });
 }
 
@@ -211,11 +244,12 @@ async function logout() {
   state.user = null;
   state.products = [];
   state.report = null;
+  state.notices = [];
   showAuth();
 }
 
 async function loadAll() {
-  await Promise.all([loadProducts(), loadReport()]);
+  await Promise.all([loadProducts(), loadReport(), loadNotices()]);
 }
 
 async function loadProducts() {
@@ -228,6 +262,11 @@ async function loadReport() {
   state.report = await api("/api/report");
 }
 
+async function loadNotices() {
+  const result = await api("/api/notices");
+  state.notices = result.notices || [];
+}
+
 function showAuth() {
   el.appView.hidden = true;
   el.authView.hidden = false;
@@ -238,14 +277,17 @@ function showApp() {
   el.authView.hidden = true;
   el.appView.hidden = false;
   el.userEmail.textContent = `${state.user?.email || ""} / ${state.user?.phone || ""}`;
+  syncProfileForm();
   render();
 }
 
 function render() {
   renderConfig();
   renderKpis();
+  renderNotices();
   renderProducts();
   renderReport();
+  syncProfileForm();
   setView(state.activeView);
 }
 
@@ -325,16 +367,143 @@ function renderProducts() {
 function renderReport() {
   const report = state.report || { thresholdDrops: [], rangeDrops: [], newEntries: [], rankChanges: [] };
   const signals = [
+    ...report.newEntries.map((item) => ({ ...item, tone: "good" })),
     ...report.thresholdDrops.map((item) => ({ ...item, tone: "warn" })),
-    ...report.rangeDrops.map((item) => ({ ...item, tone: "bad" })),
-    ...report.newEntries.map((item) => ({ ...item, tone: "good" }))
-  ].slice(0, 8);
+    ...report.rangeDrops.map((item) => ({ ...item, tone: "bad" }))
+  ].slice(0, 20);
   el.signalList.innerHTML = signals.length ? signals.map(renderSignalItem).join("") : emptyBlock("감지된 신호가 없습니다.", "최근 7일 기준으로 조건에 걸린 키워드 결과가 없습니다.");
   el.thresholdReport.innerHTML = report.thresholdDrops.length ? report.thresholdDrops.map(renderReportItem).join("") : emptyLine("기준밖 이탈 없음");
   el.dropReport.innerHTML = report.rangeDrops.length ? report.rangeDrops.map(renderReportItem).join("") : emptyLine("하락폭 감지 없음");
   el.entryReport.innerHTML = report.newEntries.length ? report.newEntries.map(renderReportItem).join("") : emptyLine("신규 진입 없음");
   if (el.rankChangeReport) {
     el.rankChangeReport.innerHTML = report.rankChanges?.length ? report.rankChanges.slice(0, 80).map(renderReportItem).join("") : emptyLine("순위 변동 없음");
+  }
+}
+
+function renderNotices() {
+  const notices = state.notices || [];
+  const hasNotices = notices.length > 0;
+  if (el.noticeDock) {
+    el.noticeDock.hidden = !hasNotices || !state.noticesOpen;
+  }
+  if (el.noticeDockMeta) {
+    el.noticeDockMeta.textContent = hasNotices ? `최근 ${notices.length}개` : "등록된 공지 없음";
+  }
+  if (el.noticeDockList) {
+    el.noticeDockList.innerHTML = hasNotices
+      ? notices.slice(0, 2).map((notice) => renderNotice(notice, { compact: true })).join("")
+      : emptyBlock("공지사항이 없습니다.", "관리자가 공지를 등록하면 이곳에 표시됩니다.");
+  }
+  if (el.noticeList) {
+    el.noticeList.innerHTML = hasNotices
+      ? notices.map((notice) => renderNotice(notice)).join("")
+      : emptyBlock("공지사항이 없습니다.", "관리자가 공지를 등록하면 이곳에 표시됩니다.");
+  }
+}
+
+function renderNotice(notice, options = {}) {
+  const comments = notice.comments || [];
+  return `
+    <article class="notice-card">
+      <div class="notice-title-row">
+        <div>
+          <strong>${esc(notice.title || "공지")}</strong>
+          <span>${formatTime(notice.updatedAt || notice.createdAt)}</span>
+        </div>
+      </div>
+      <p>${esc(notice.body || "").replace(/\n/g, "<br>")}</p>
+      ${options.compact ? "" : `
+        <div class="notice-comments">
+          <strong>댓글 ${comments.length}개</strong>
+          ${comments.length ? comments.map(renderNoticeComment).join("") : `<span class="comment-empty">아직 댓글이 없습니다.</span>`}
+        </div>
+        <form class="notice-comment-form" data-notice-comment-form="${esc(notice.id)}">
+          <textarea name="body" maxlength="1000" placeholder="댓글을 입력하세요" required></textarea>
+          <button class="ghost" type="submit">댓글 등록</button>
+        </form>
+      `}
+    </article>
+  `;
+}
+
+function renderNoticeComment(comment) {
+  const name = comment.storeName || comment.userEmail || comment.userPhone || "회원";
+  return `
+    <div class="notice-comment">
+      <div><strong>${esc(name)}</strong><span>${formatTime(comment.createdAt)}</span></div>
+      <p>${esc(comment.body || "")}</p>
+    </div>
+  `;
+}
+
+async function submitNoticeComment(event) {
+  const form = event.target.closest("[data-notice-comment-form]");
+  if (!form) return;
+  event.preventDefault();
+  const noticeId = form.dataset.noticeCommentForm;
+  const bodyInput = form.elements.body;
+  const body = bodyInput.value.trim();
+  if (!body) {
+    toast("댓글 내용을 입력해 주세요.");
+    return;
+  }
+
+  setBusy(true);
+  try {
+    await api(`/api/notices/${encodeURIComponent(noticeId)}/comments`, {
+      method: "POST",
+      body: { body }
+    });
+    form.reset();
+    await loadNotices();
+    renderNotices();
+    toast("댓글을 등록했습니다.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function syncProfileForm() {
+  if (!el.profileForm || !state.user) return;
+  el.profileForm.email.value = state.user.email || "";
+  el.profileForm.phone.value = state.user.phone || "";
+  el.profileForm.storeName.value = state.user.storeName || "";
+  el.profileForm.currentPassword.value = "";
+  el.profileForm.newPassword.value = "";
+}
+
+async function saveProfile(event) {
+  event.preventDefault();
+  const form = new FormData(el.profileForm);
+  const payload = Object.fromEntries(form.entries());
+  payload.email = String(payload.email || "").trim().toLowerCase();
+  payload.phone = String(payload.phone || "").trim();
+  payload.storeName = String(payload.storeName || "").trim();
+  payload.currentPassword = String(payload.currentPassword || "");
+  payload.newPassword = String(payload.newPassword || "");
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.email)) {
+    toast("이메일 형식이 올바르지 않습니다.");
+    return;
+  }
+  if (!/^010\d{8}$/.test(payload.phone)) {
+    toast("전화번호는 010으로 시작하는 숫자 11자리로 입력해 주세요.");
+    return;
+  }
+
+  setBusy(true);
+  try {
+    const result = await api("/api/me", { method: "PATCH", body: payload });
+    state.user = result.user;
+    el.userEmail.textContent = `${state.user?.email || ""} / ${state.user?.phone || ""}`;
+    syncProfileForm();
+    toast(result.message || "회원 정보를 저장했습니다.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -374,7 +543,9 @@ function setView(view) {
   const titles = {
     dashboard: ["대시보드", "등록 키워드의 최근 7일 순위 신호를 확인합니다."],
     products: ["키워드", "매일 1~50위 순위를 저장할 키워드를 관리합니다."],
-    report: ["7일 리포트", "키워드별 원본 순위와 변동 내역을 확인합니다."]
+    report: ["7일 리포트", "키워드별 원본 순위와 변동 내역을 확인합니다."],
+    notices: ["공지사항", "관리자 공지와 회원 댓글을 확인합니다."],
+    profile: ["내 정보", "회원 정보를 수정합니다."]
   };
   const [title, sub] = titles[state.activeView] || titles.dashboard;
   el.pageTitle.textContent = title;

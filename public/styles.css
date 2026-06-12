@@ -850,6 +850,116 @@ input:focus, textarea:focus, select:focus {
   font-size: 13px;
 }
 
+.notice-dock {
+  margin-bottom: 18px;
+  padding: 16px;
+  border-radius: 8px;
+  background: #fbfdf9;
+  border: 1px solid #cfe0d4;
+  box-shadow: 0 10px 28px rgba(23, 32, 27, 0.05);
+}
+
+.notice-dock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.notice-dock-head span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.notice-list {
+  display: grid;
+  gap: 12px;
+}
+
+.notice-card {
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.notice-title-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.notice-title-row strong {
+  display: block;
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+
+.notice-title-row span,
+.notice-card > p,
+.comment-empty {
+  color: var(--muted);
+}
+
+.notice-card > p {
+  margin: 0;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.notice-comments {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.notice-comment {
+  padding: 10px;
+  border-radius: 8px;
+  background: #f7faf6;
+  border: 1px solid var(--line);
+}
+
+.notice-comment div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.notice-comment p {
+  margin: 6px 0 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.notice-comment-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 12px;
+  align-items: end;
+}
+
+.notice-comment-form textarea {
+  min-height: 78px;
+  padding: 11px 13px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.profile-form {
+  display: grid;
+  gap: 14px;
+}
+
 .empty {
   min-height: 128px;
   display: grid;
@@ -980,7 +1090,7 @@ input:focus, textarea:focus, select:focus {
     margin: 14px auto;
   }
 
-  .signal-grid, .two-col, .keyword-row, .bulk-slot {
+  .signal-grid, .two-col, .keyword-row, .bulk-slot, .notice-comment-form {
     grid-template-columns: 1fr;
   }
 

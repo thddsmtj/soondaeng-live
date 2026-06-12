@@ -310,6 +310,21 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if ((method === "PATCH" || method === "PUT" || method === "POST") && requestUrl.pathname === "/api/me") {
+    const body = await readJson(req);
+    await updateUserProfile(req, res, auth.user, body);
+    return;
+  }
+
+  if (method === "POST" && segments[0] === "api" && segments[1] === "notices" && segments[2] && segments[3] === "comments") {
+    const body = await readJson(req);
+    const db = auth.db;
+    const notice = createNoticeComment(db, segments[2], auth.user, body);
+    await writeDb(db);
+    sendJson(res, 201, { notice });
+    return;
+  }
+
   if (method === "GET" && requestUrl.pathname === "/api/products") {
     const db = await readDb();
     const products = db.products
@@ -498,6 +513,61 @@ async function logoutUser(req, res) {
   }
   clearSessionCookie(req, res);
   sendJson(res, 200, { ok: true });
+}
+
+async function updateUserProfile(req, res, currentUser, body) {
+  const email = String(body.email || "").trim().toLowerCase();
+  const phone = normalizePhone(body.phone);
+  const storeName = String(body.storeName || "").trim().slice(0, 80);
+  const currentPassword = String(body.currentPassword || "");
+  const newPassword = String(body.newPassword || "");
+
+  if (!isValidEmail(email)) {
+    sendJson(res, 400, { error: "INVALID_EMAIL", message: "이메일 형식이 올바르지 않습니다." });
+    return;
+  }
+
+  if (!isValidPhone(phone)) {
+    sendJson(res, 400, { error: "INVALID_PHONE", message: "전화번호는 010으로 시작하는 숫자 11자리로 입력해 주세요. 예: 01012345678" });
+    return;
+  }
+
+  if (newPassword && newPassword.length < 8) {
+    sendJson(res, 400, { error: "WEAK_PASSWORD", message: "새 비밀번호는 8자 이상이어야 합니다." });
+    return;
+  }
+
+  const db = await readDb();
+  const user = db.users.find((item) => item.id === currentUser.id);
+  if (!user) {
+    sendJson(res, 404, { error: "USER_NOT_FOUND", message: "회원 정보를 찾을 수 없습니다." });
+    return;
+  }
+
+  if (db.users.some((item) => item.id !== user.id && item.email === email)) {
+    sendJson(res, 409, { error: "EMAIL_EXISTS", message: "이미 가입된 이메일입니다." });
+    return;
+  }
+
+  if (db.users.some((item) => item.id !== user.id && normalizePhone(item.phone) === phone)) {
+    sendJson(res, 409, { error: "PHONE_EXISTS", message: "이미 가입된 전화번호입니다." });
+    return;
+  }
+
+  if (newPassword) {
+    if (!currentPassword || !verifyPassword(currentPassword, user.passwordHash)) {
+      sendJson(res, 401, { error: "BAD_PASSWORD", message: "현재 비밀번호가 맞지 않습니다." });
+      return;
+    }
+    user.passwordHash = hashPassword(newPassword);
+  }
+
+  user.email = email;
+  user.phone = phone;
+  user.storeName = storeName;
+  user.updatedAt = Date.now();
+  await writeDb(db);
+  sendJson(res, 200, { user: publicUser(user), message: "회원 정보를 저장했습니다." });
 }
 
 async function getOptionalUser(req) {
@@ -863,14 +933,79 @@ function deleteNotice(db, noticeId) {
   return { ok: true, noticeId };
 }
 
+function createNoticeComment(db, noticeId, user, body) {
+  db.meta = db.meta || {};
+  db.meta.notices = Array.isArray(db.meta.notices) ? db.meta.notices : [];
+  const notice = db.meta.notices.find((item) => item.id === noticeId && !item.deletedAt);
+  if (!notice) {
+    const error = new Error("Notice not found");
+    error.statusCode = 404;
+    error.code = "NOTICE_NOT_FOUND";
+    error.publicMessage = "공지를 찾을 수 없습니다.";
+    throw error;
+  }
+
+  const bodyText = String(body.body || "").trim().slice(0, 1000);
+  if (!bodyText) {
+    const error = new Error("Invalid notice comment");
+    error.statusCode = 400;
+    error.code = "INVALID_NOTICE_COMMENT";
+    error.publicMessage = "댓글 내용을 입력해 주세요.";
+    throw error;
+  }
+
+  notice.comments = Array.isArray(notice.comments) ? notice.comments : [];
+  notice.comments.push({
+    id: uid(),
+    userId: user.id,
+    userEmail: user.email || "",
+    userPhone: normalizePhone(user.phone),
+    storeName: user.storeName || "",
+    body: bodyText,
+    createdAt: Date.now()
+  });
+  notice.comments = notice.comments.slice(-200);
+  notice.updatedAt = Date.now();
+  return publicNotice(notice);
+}
+
 function publicNotice(notice) {
   return {
     id: notice.id,
     title: notice.title || "",
     body: notice.body || "",
     createdAt: notice.createdAt || null,
-    updatedAt: notice.updatedAt || null
+    updatedAt: notice.updatedAt || null,
+    comments: (Array.isArray(notice.comments) ? notice.comments : [])
+      .filter((comment) => !comment.deletedAt)
+      .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0))
+      .slice(-100)
+      .map(publicNoticeComment)
   };
+}
+
+function publicNoticeComment(comment) {
+  return {
+    id: comment.id,
+    userEmail: maskEmail(comment.userEmail || ""),
+    userPhone: maskPhone(comment.userPhone || ""),
+    storeName: comment.storeName || "",
+    body: comment.body || "",
+    createdAt: comment.createdAt || null
+  };
+}
+
+function maskEmail(value) {
+  const email = String(value || "");
+  const [local, domain] = email.split("@");
+  if (!local || !domain) return email;
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+function maskPhone(value) {
+  const phone = normalizePhone(value);
+  if (!phone || phone.length < 7) return phone;
+  return `${phone.slice(0, 3)}****${phone.slice(-4)}`;
 }
 
 function getUserProductLimit(user) {
@@ -1251,8 +1386,9 @@ function buildRankReport(db, options = {}) {
     keywordReports,
     rawRows: rawRows.sort((a, b) => String(a.keyword).localeCompare(String(b.keyword), "ko") || Number(a.checkedAt || 0) - Number(b.checkedAt || 0) || Number(a.rankNumber || 0) - Number(b.rankNumber || 0)),
     email: {
-      configured: Boolean(RESEND_API_KEY && REPORT_FROM && REPORT_RECIPIENTS.length),
-      recipients: REPORT_RECIPIENTS
+      configured: Boolean(RESEND_API_KEY && REPORT_FROM),
+      mode: "members",
+      adminCopyRecipients: REPORT_RECIPIENTS
     }
   };
 }
@@ -1626,11 +1762,22 @@ function reportFileName(report) {
 
 async function createAndSendRankReport(db, slotKey, source) {
   const report = buildRankReport(db);
-  const workbook = buildRankReportWorkbook(report);
-  const email = await sendRankReportEmail(report, workbook).catch((error) => ({
+  const email = await sendMemberRankReportEmails(db).catch((error) => ({
     status: "error",
+    mode: "members",
     message: error.message || "이메일 발송 중 오류가 발생했습니다."
   }));
+
+  if (REPORT_RECIPIENTS.length) {
+    const workbook = buildRankReportWorkbook(report);
+    email.adminCopy = await sendRankReportEmail(report, workbook, REPORT_RECIPIENTS, {
+      subject: `[순댕이 관리자] ${getDateKey(report.generatedAt, SCHEDULE_TIMEZONE)} 전체 순위 리포트`
+    }).catch((error) => ({
+      status: "error",
+      message: error.message || "관리자 참고 메일 발송 중 오류가 발생했습니다."
+    }));
+  }
+
   db.meta = db.meta || {};
   db.meta.reports = Array.isArray(db.meta.reports) ? db.meta.reports : [];
   const stored = {
@@ -1646,11 +1793,94 @@ async function createAndSendRankReport(db, slotKey, source) {
   return stored;
 }
 
-async function sendRankReportEmail(report, workbook) {
-  if (!RESEND_API_KEY || !REPORT_FROM || !REPORT_RECIPIENTS.length) {
+async function sendMemberRankReportEmails(db) {
+  if (!RESEND_API_KEY || !REPORT_FROM) {
     return {
       status: "skipped",
-      message: "RESEND_API_KEY, REPORT_FROM, REPORT_RECIPIENTS 환경변수가 모두 설정되어야 이메일이 발송됩니다."
+      mode: "members",
+      sentCount: 0,
+      skippedCount: 0,
+      errorCount: 0,
+      message: "RESEND_API_KEY와 REPORT_FROM 환경변수가 있어야 회원별 이메일이 발송됩니다."
+    };
+  }
+
+  const users = (db.users || [])
+    .filter((user) => isUserApproved(user))
+    .filter((user) => !getUserRestrictions(user).suspended)
+    .filter((user) => isValidEmail(user.email || ""));
+
+  if (!users.length) {
+    return {
+      status: "skipped",
+      mode: "members",
+      sentCount: 0,
+      skippedCount: 0,
+      errorCount: 0,
+      message: "발송 대상 회원이 없습니다."
+    };
+  }
+
+  const results = [];
+  for (const user of users) {
+    const report = buildRankReport(db, { userId: user.id });
+    if (!report.summary.keywordCount) {
+      results.push({
+        userId: user.id,
+        email: user.email,
+        status: "skipped",
+        message: "등록된 키워드가 없어 건너뜀"
+      });
+      continue;
+    }
+
+    const workbook = buildRankReportWorkbook(report);
+    try {
+      const email = await sendRankReportEmail(report, workbook, [user.email], {
+        user,
+        subject: `[순댕이] ${getDateKey(report.generatedAt, SCHEDULE_TIMEZONE)} 내 키워드 순위 리포트`
+      });
+      results.push({
+        userId: user.id,
+        email: user.email,
+        status: email.status,
+        provider: email.provider
+      });
+    } catch (error) {
+      results.push({
+        userId: user.id,
+        email: user.email,
+        status: "error",
+        message: error.publicMessage || error.message || "발송 실패"
+      });
+    }
+  }
+
+  const sentCount = results.filter((item) => item.status === "sent").length;
+  const errorCount = results.filter((item) => item.status === "error").length;
+  const skippedCount = results.filter((item) => item.status === "skipped").length;
+  return {
+    status: sentCount ? "sent" : errorCount ? "error" : "skipped",
+    mode: "members",
+    sentCount,
+    skippedCount,
+    errorCount,
+    recipients: results.filter((item) => item.status === "sent").map((item) => item.email),
+    message: sentCount
+      ? `회원 ${sentCount}명에게 리포트를 발송했습니다.`
+      : errorCount
+        ? "회원별 이메일 발송이 실패했습니다."
+        : "발송할 회원 키워드가 없습니다.",
+    results: results.slice(0, 100)
+  };
+}
+
+async function sendRankReportEmail(report, workbook, recipients, options = {}) {
+  const to = Array.isArray(recipients) ? recipients.filter(Boolean) : splitRecipients(recipients);
+  if (!RESEND_API_KEY || !REPORT_FROM || !to.length) {
+    return {
+      status: "skipped",
+      message: "RESEND_API_KEY, REPORT_FROM, 받을 이메일이 모두 있어야 이메일이 발송됩니다."
     };
   }
 
@@ -1662,11 +1892,15 @@ async function sendRankReportEmail(report, workbook) {
     },
     body: JSON.stringify({
       from: REPORT_FROM,
-      to: REPORT_RECIPIENTS,
-      subject: `[순댕이] ${getDateKey(report.generatedAt, SCHEDULE_TIMEZONE)} 순위 리포트`,
+      to,
+      subject: options.subject || `[순댕이] ${getDateKey(report.generatedAt, SCHEDULE_TIMEZONE)} 순위 리포트`,
       text: [
-        "순댕이 최근 7일 순위 리포트입니다.",
+        options.user?.storeName
+          ? `${options.user.storeName} 순댕이 최근 7일 순위 리포트입니다.`
+          : "순댕이 최근 7일 순위 리포트입니다.",
         "",
+        `추적 키워드: ${report.summary.keywordCount}개`,
+        `최신 수집 상품: ${report.summary.productCount}개`,
         `기준순위 밖 이탈: ${report.summary.thresholdDropCount}건`,
         `지정 하락폭 이상: ${report.summary.rangeDropCount}건`,
         `50위 밖 신규 진입: ${report.summary.newEntryCount}건`,
@@ -1690,7 +1924,7 @@ async function sendRankReportEmail(report, workbook) {
 
   return {
     status: "sent",
-    recipients: REPORT_RECIPIENTS,
+    recipients: to,
     provider: "resend",
     response: text.slice(0, 500)
   };
