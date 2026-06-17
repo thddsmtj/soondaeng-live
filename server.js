@@ -30,6 +30,7 @@ const MAX_USER_PRODUCT_LIMIT = 1000;
 const RANK_SCAN_LIMIT = 50;
 const SCHEDULE_TIMEZONE = process.env.SCHEDULE_TIMEZONE || "Asia/Seoul";
 const SCHEDULE_TIMES = parseScheduleTimes(process.env.SCHEDULE_TIMES || "08:00");
+const SCHEDULE_CATCHUP_MINUTES = clamp(Number(process.env.SCHEDULE_CATCHUP_MINUTES || 180), 0, 720);
 const REPORT_RECIPIENTS = splitRecipients(process.env.REPORT_RECIPIENTS || "");
 const REPORT_FROM = process.env.REPORT_FROM || process.env.EMAIL_FROM || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
@@ -264,7 +265,9 @@ async function handleApi(req, res, requestUrl) {
       scanLimit: RANK_SCAN_LIMIT,
       productLimit: optionalUser ? getUserProductLimit(optionalUser) : FREE_PRODUCT_LIMIT,
       scheduleTimes: SCHEDULE_TIMES.map((item) => item.label),
-      scheduleTimezone: SCHEDULE_TIMEZONE
+      scheduleTimezone: SCHEDULE_TIMEZONE,
+      scheduleCatchupMinutes: SCHEDULE_CATCHUP_MINUTES,
+      emailConfigured: Boolean(RESEND_API_KEY && REPORT_FROM)
     });
     return;
   }
@@ -2355,12 +2358,43 @@ async function runCronTracking(req, res, requestUrl) {
   }
 
   const now = getTimeInZone(SCHEDULE_TIMEZONE);
-  const slotKey = `external:${now.date}:${String(now.hour).padStart(2, "0")}:${String(now.minute).padStart(2, "0")}`;
-  const result = await runScheduledTracking(slotKey, "auto");
-  sendJson(res, 200, {
+  const dueSlot = getDueScheduleSlot(now);
+  if (!dueSlot) {
+    sendJson(res, 200, {
+      ok: true,
+      skipped: true,
+      source: "external-cron",
+      reason: "no_due_schedule",
+      message: `현재 ${SCHEDULE_TIMEZONE} 기준 실행할 예약 시간이 없습니다.`,
+      scheduleTimes: SCHEDULE_TIMES.map((item) => item.label),
+      catchupMinutes: SCHEDULE_CATCHUP_MINUTES
+    });
+    return;
+  }
+
+  const claim = await claimScheduledRun(dueSlot.slotKey);
+  if (!claim.claimed) {
+    sendJson(res, 200, {
+      ok: true,
+      skipped: true,
+      source: "external-cron",
+      reason: "already_ran",
+      slotKey: dueSlot.slotKey,
+      message: "이미 처리된 예약 작업입니다."
+    });
+    return;
+  }
+
+  runScheduledTracking(dueSlot.slotKey, "auto").catch((error) => {
+    console.error(`[schedule] external cron failed ${dueSlot.slotKey}`, error);
+  });
+
+  sendJson(res, 202, {
     ok: true,
     source: "external-cron",
-    ...result
+    queued: true,
+    slotKey: dueSlot.slotKey,
+    message: "예약 수집 작업을 접수했습니다. 수집과 메일 발송은 서버에서 계속 진행됩니다."
   });
 }
 
@@ -3081,21 +3115,13 @@ async function checkScheduledTracking() {
   if (!NAVER_CLIENT_ID || !NAVER_CLIENT_SECRET) return;
 
   const now = getTimeInZone(SCHEDULE_TIMEZONE);
-  const slot = SCHEDULE_TIMES.find((item) => item.hour === now.hour && item.minute === now.minute);
-  if (!slot) return;
+  const dueSlot = getDueScheduleSlot(now);
+  if (!dueSlot) return;
 
-  const slotKey = `${now.date}:${slot.label}`;
-  const db = await readDb();
-  db.meta.scheduler = db.meta.scheduler || {};
-  db.meta.scheduler.lastRuns = db.meta.scheduler.lastRuns || {};
+  const claim = await claimScheduledRun(dueSlot.slotKey);
+  if (!claim.claimed) return;
 
-  if (db.meta.scheduler.lastRuns[slotKey]) return;
-
-  db.meta.scheduler.lastRuns[slotKey] = Date.now();
-  pruneLastRuns(db.meta.scheduler.lastRuns);
-  await writeDb(db);
-
-  await runScheduledTracking(slotKey, "auto");
+  await runScheduledTracking(dueSlot.slotKey, "auto");
 }
 
 async function runScheduledTracking(slotKey, source = "auto") {
@@ -3103,6 +3129,7 @@ async function runScheduledTracking(slotKey, source = "auto") {
     return { skipped: true, reason: "tracking_already_running", slotKey };
   }
   scheduledTrackingRunning = true;
+  console.log(`[schedule] started ${source} ${slotKey}`);
 
   try {
     const db = await readDb();
@@ -3140,6 +3167,7 @@ async function runScheduledTracking(slotKey, source = "auto") {
       emailStatus: reportResult.email?.status || ""
     });
     await writeDb(latest);
+    console.log(`[schedule] completed ${source} ${slotKey} products=${productCount} keywords=${keywordCount} email=${reportResult.email?.status || ""}`);
 
     return {
       skipped: false,
@@ -3153,6 +3181,21 @@ async function runScheduledTracking(slotKey, source = "auto") {
   } finally {
     scheduledTrackingRunning = false;
   }
+}
+
+async function claimScheduledRun(slotKey) {
+  const db = await readDb();
+  db.meta.scheduler = db.meta.scheduler || {};
+  db.meta.scheduler.lastRuns = db.meta.scheduler.lastRuns || {};
+
+  if (db.meta.scheduler.lastRuns[slotKey]) {
+    return { claimed: false, db };
+  }
+
+  db.meta.scheduler.lastRuns[slotKey] = Date.now();
+  pruneLastRuns(db.meta.scheduler.lastRuns);
+  await writeDb(db);
+  return { claimed: true, db };
 }
 
 function getCronSecret(req, requestUrl) {
@@ -3241,6 +3284,25 @@ function parseScheduleTimes(value) {
       return { hour, minute, label: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
     })
     .filter(Boolean);
+}
+
+function getDueScheduleSlot(now) {
+  if (!SCHEDULE_TIMES.length) return null;
+
+  const nowMinutes = now.hour * 60 + now.minute;
+  const candidates = SCHEDULE_TIMES
+    .map((slot) => {
+      const slotMinutes = slot.hour * 60 + slot.minute;
+      return {
+        slot,
+        elapsedMinutes: nowMinutes - slotMinutes,
+        slotKey: `${now.date}:${slot.label}`
+      };
+    })
+    .filter((item) => item.elapsedMinutes >= 0 && item.elapsedMinutes <= SCHEDULE_CATCHUP_MINUTES)
+    .sort((a, b) => a.elapsedMinutes - b.elapsedMinutes);
+
+  return candidates[0] || null;
 }
 
 function getTimeInZone(timeZone) {
