@@ -31,6 +31,7 @@ const RANK_SCAN_LIMIT = 50;
 const SCHEDULE_TIMEZONE = process.env.SCHEDULE_TIMEZONE || "Asia/Seoul";
 const SCHEDULE_TIMES = parseScheduleTimes(process.env.SCHEDULE_TIMES || "08:00");
 const SCHEDULE_CATCHUP_MINUTES = clamp(Number(process.env.SCHEDULE_CATCHUP_MINUTES || 180), 0, 720);
+const SCHEDULE_RETRY_AFTER_MINUTES = clamp(Number(process.env.SCHEDULE_RETRY_AFTER_MINUTES || 30), 5, 240);
 const REPORT_RECIPIENTS = splitRecipients(process.env.REPORT_RECIPIENTS || "");
 const REPORT_FROM = process.env.REPORT_FROM || process.env.EMAIL_FROM || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
@@ -2367,7 +2368,8 @@ async function runCronTracking(req, res, requestUrl) {
       reason: "no_due_schedule",
       message: `현재 ${SCHEDULE_TIMEZONE} 기준 실행할 예약 시간이 없습니다.`,
       scheduleTimes: SCHEDULE_TIMES.map((item) => item.label),
-      catchupMinutes: SCHEDULE_CATCHUP_MINUTES
+      catchupMinutes: SCHEDULE_CATCHUP_MINUTES,
+      retryAfterMinutes: SCHEDULE_RETRY_AFTER_MINUTES
     });
     return;
   }
@@ -2378,9 +2380,11 @@ async function runCronTracking(req, res, requestUrl) {
       ok: true,
       skipped: true,
       source: "external-cron",
-      reason: "already_ran",
+      reason: claim.reason || "already_ran",
       slotKey: dueSlot.slotKey,
-      message: "이미 처리된 예약 작업입니다."
+      message: claim.reason === "already_completed"
+        ? "이미 완료된 예약 작업입니다."
+        : "최근에 시작된 예약 작업입니다. 중복 실행을 막았습니다."
     });
     return;
   }
@@ -3188,8 +3192,16 @@ async function claimScheduledRun(slotKey) {
   db.meta.scheduler = db.meta.scheduler || {};
   db.meta.scheduler.lastRuns = db.meta.scheduler.lastRuns || {};
 
-  if (db.meta.scheduler.lastRuns[slotKey]) {
-    return { claimed: false, db };
+  const existingRunAt = Number(db.meta.scheduler.lastRuns[slotKey] || 0);
+  const completed = db.meta.scheduler.lastCompletedSlot === slotKey
+    || (db.meta.scheduler.logs || []).some((log) => log.slotKey === slotKey && log.status === "completed");
+
+  if (completed) {
+    return { claimed: false, reason: "already_completed", db };
+  }
+
+  if (existingRunAt && Date.now() - existingRunAt < SCHEDULE_RETRY_AFTER_MINUTES * 60000) {
+    return { claimed: false, reason: "recently_started", db };
   }
 
   db.meta.scheduler.lastRuns[slotKey] = Date.now();
