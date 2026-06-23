@@ -28,6 +28,7 @@ const FREE_PRODUCT_LIMIT = clamp(Number(process.env.FREE_PRODUCT_LIMIT || 100), 
 const MIN_USER_PRODUCT_LIMIT = 100;
 const MAX_USER_PRODUCT_LIMIT = 1000;
 const RANK_SCAN_LIMIT = 50;
+const MAX_SNAPSHOT_ROWS = clamp(Number(process.env.MAX_SNAPSHOT_ROWS || 0), 0, 5000000);
 const SCHEDULE_TIMEZONE = process.env.SCHEDULE_TIMEZONE || "Asia/Seoul";
 const SCHEDULE_TIMES = parseScheduleTimes(process.env.SCHEDULE_TIMES || "08:00");
 const SCHEDULE_CATCHUP_MINUTES = clamp(Number(process.env.SCHEDULE_CATCHUP_MINUTES || 180), 0, 720);
@@ -1400,9 +1401,13 @@ function buildRankReport(db, options = {}) {
     const rows = (snapshotsByTarget.get(product.id) || [])
       .filter((snapshot) => snapshot.status !== "error")
       .sort((a, b) => Number(a.checkedAt || 0) - Number(b.checkedAt || 0) || Number(a.rank || 0) - Number(b.rank || 0));
-    rows.forEach((record) => rawRows.push(keywordRankRawRow(product, keyword, owner, record)));
 
-    const collections = buildKeywordCollections(rows);
+    const collections = buildKeywordCollections(rows).slice(-windowDays);
+    const collectionIds = new Set(collections.map((collection) => collection.collectionId));
+    rows
+      .filter((record) => collectionIds.has(snapshotCollectionKey(record)))
+      .forEach((record) => rawRows.push(keywordRankRawRow(product, keyword, owner, record)));
+
     const comparison = compareKeywordCollections(product, keyword, owner, collections);
     thresholdDrops.push(...comparison.thresholdDrops);
     rangeDrops.push(...comparison.rangeDrops);
@@ -1464,7 +1469,7 @@ function buildKeywordCollections(rows) {
     const checkedAt = Number(row.checkedAt || 0);
     if (!checkedAt) continue;
     const dateKey = row.dateKey || getDateKey(checkedAt, SCHEDULE_TIMEZONE);
-    const collectionId = row.collectionId || `${dateKey}:${checkedAt}`;
+    const collectionId = snapshotCollectionKey(row);
     if (!byCollection.has(collectionId)) {
       byCollection.set(collectionId, {
         collectionId,
@@ -1488,6 +1493,17 @@ function buildKeywordCollections(rows) {
   return [...latestByDay.values()].sort((a, b) => a.checkedAt - b.checkedAt);
 }
 
+function snapshotDateKey(snapshot) {
+  const checkedAt = Number(snapshot?.checkedAt || 0);
+  return snapshot?.dateKey || (checkedAt ? getDateKey(checkedAt, SCHEDULE_TIMEZONE) : "");
+}
+
+function snapshotCollectionKey(snapshot) {
+  const checkedAt = Number(snapshot?.checkedAt || 0);
+  const dateKey = snapshotDateKey(snapshot);
+  return snapshot?.collectionId || `${dateKey}:${checkedAt}`;
+}
+
 function snapshotToRankItem(snapshot) {
   return {
     rank: normalizeReportRank(snapshot.rank),
@@ -1502,8 +1518,15 @@ function snapshotToRankItem(snapshot) {
 }
 
 function compareKeywordCollections(product, keyword, owner, collections) {
-  const thresholdDrops = [];
-  const newEntries = [];
+  return {
+    thresholdDrops: findKeywordThresholdDropEvents(product, keyword, owner, collections),
+    rangeDrops: findKeywordRangeDropEvents(product, keyword, owner, collections),
+    newEntries: findKeywordNewEntryEvents(product, keyword, owner, collections),
+    rankChanges: findKeywordAdjacentRankChanges(product, keyword, owner, collections)
+  };
+}
+
+function findKeywordAdjacentRankChanges(product, keyword, owner, collections) {
   const rankChanges = [];
 
   for (let index = 1; index < collections.length; index += 1) {
@@ -1520,18 +1543,6 @@ function compareKeywordCollections(product, keyword, owner, collections) {
       const nextRank = next?.rank || null;
       const item = next || prev;
 
-      if (!prevRank && nextRank) {
-        newEntries.push(keywordEventRow(product, keyword, owner, item, {
-          type: "50위 밖에서 신규 진입",
-          threshold: RANK_SCAN_LIMIT,
-          fromRank: null,
-          toRank: nextRank,
-          fromAt: previous.checkedAt,
-          toAt: current.checkedAt,
-          detail: `${previous.dateKey} 50위 밖 -> ${current.dateKey} ${nextRank}위`
-        }));
-      }
-
       if (prevRank && (nextRank || RANK_SCAN_LIMIT + 1) !== prevRank) {
         const effectiveNext = nextRank || RANK_SCAN_LIMIT + 1;
         const diff = effectiveNext - prevRank;
@@ -1545,37 +1556,17 @@ function compareKeywordCollections(product, keyword, owner, collections) {
           detail: `${previous.dateKey} ${prevRank}위 -> ${current.dateKey} ${rankLabel(nextRank)}`
         }));
       }
-
-      for (const threshold of normalizeRankThresholds(product.alertRanks || keyword.alertRanks)) {
-        if (isInsideRank(prevRank, threshold) && !isInsideRank(nextRank, threshold)) {
-          thresholdDrops.push(keywordEventRow(product, keyword, owner, item, {
-            type: "기준순위 밖 이탈",
-            threshold,
-            fromRank: prevRank,
-            toRank: nextRank,
-            fromAt: previous.checkedAt,
-            toAt: current.checkedAt,
-            detail: `${previous.dateKey} ${prevRank}위 -> ${current.dateKey} ${rankLabel(nextRank)}`
-          }));
-        }
-      }
     }
   }
 
-  return {
-    thresholdDrops,
-    rangeDrops: findKeywordRangeDropEvents(product, keyword, owner, collections),
-    newEntries,
-    rankChanges
-  };
+  return rankChanges;
 }
 
 function rankItemMap(items) {
   return new Map((items || []).filter((item) => item.itemKey).map((item) => [item.itemKey, item]));
 }
 
-function findKeywordRangeDropEvents(product, keyword, owner, collections) {
-  const threshold = normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold);
+function collectKeywordItemRecords(collections) {
   const byItem = new Map();
   for (const collection of collections) {
     for (const item of collection.items || []) {
@@ -1584,31 +1575,105 @@ function findKeywordRangeDropEvents(product, keyword, owner, collections) {
       byItem.get(item.itemKey).push({ ...item, checkedAt: collection.checkedAt, dateKey: collection.dateKey });
     }
   }
+  return byItem;
+}
 
+function bestRankRecord(records) {
+  return (records || []).reduce((best, record) => {
+    if (!record.rank) return best;
+    if (!best || record.rank < best.rank || (record.rank === best.rank && record.checkedAt > best.checkedAt)) return record;
+    return best;
+  }, null);
+}
+
+function currentRankRecord(collection, itemKey) {
+  return rankItemMap(collection?.items || []).get(itemKey) || null;
+}
+
+function latestCollectionLabel(collection) {
+  return collection?.dateKey ? `${collection.dateKey} 오늘` : "오늘";
+}
+
+function findKeywordNewEntryEvents(product, keyword, owner, collections) {
+  if (collections.length < 2) return [];
+  const latest = collections.at(-1);
+  const previousKeys = new Set();
+  collections.slice(0, -1).forEach((collection) => {
+    (collection.items || []).forEach((item) => {
+      if (item.itemKey) previousKeys.add(item.itemKey);
+    });
+  });
+
+  return (latest.items || [])
+    .filter((item) => item.itemKey && !previousKeys.has(item.itemKey))
+    .map((item) => keywordEventRow(product, keyword, owner, item, {
+      type: "50위 밖에서 신규 진입",
+      threshold: RANK_SCAN_LIMIT,
+      fromRank: null,
+      toRank: item.rank,
+      fromAt: collections[0]?.checkedAt || null,
+      toAt: latest.checkedAt,
+      detail: `최근 7일 이전 50위 밖 -> ${latestCollectionLabel(latest)} ${rankLabel(item.rank)}`
+    }));
+}
+
+function findKeywordThresholdDropEvents(product, keyword, owner, collections) {
+  const latest = collections.at(-1);
+  if (!latest) return [];
+
+  const byItem = collectKeywordItemRecords(collections);
+  const thresholds = normalizeRankThresholds(product.alertRanks || keyword.alertRanks);
   const events = [];
-  for (const records of byItem.values()) {
-    let best = null;
-    for (let left = 0; left < records.length; left += 1) {
-      for (let right = left + 1; right < records.length; right += 1) {
-        const fromRank = records[left].rank;
-        const toRank = records[right].rank;
-        if (!fromRank || !toRank) continue;
-        const drop = toRank - fromRank;
-        if (drop >= threshold && (!best || drop > best.drop)) {
-          best = { item: records[right], fromRank, toRank, drop, fromAt: records[left].checkedAt, toAt: records[right].checkedAt };
-        }
+
+  for (const [itemKey, records] of byItem.entries()) {
+    const best = bestRankRecord(records);
+    if (!best) continue;
+    const current = currentRankRecord(latest, itemKey);
+    const item = current || best;
+
+    for (const threshold of thresholds) {
+      if (isInsideRank(best.rank, threshold) && !isInsideRank(current?.rank || null, threshold)) {
+        events.push(keywordEventRow(product, keyword, owner, item, {
+          type: "기준순위 밖 이탈",
+          threshold,
+          fromRank: best.rank,
+          toRank: current?.rank || null,
+          fromAt: best.checkedAt,
+          toAt: latest.checkedAt,
+          detail: `최근 7일 최고 ${formatReportDate(best.checkedAt)} ${best.rank}위 -> ${latestCollectionLabel(latest)} ${rankLabel(current?.rank || null)}`
+        }));
       }
     }
-    if (best) {
-      events.push(keywordEventRow(product, keyword, owner, best.item, {
+  }
+
+  return events;
+}
+
+function findKeywordRangeDropEvents(product, keyword, owner, collections) {
+  const latest = collections.at(-1);
+  if (!latest) return [];
+
+  const threshold = normalizeDropThreshold(product.dropThreshold || keyword.dropThreshold);
+  const byItem = collectKeywordItemRecords(collections);
+
+  const events = [];
+  for (const [itemKey, records] of byItem.entries()) {
+    const best = bestRankRecord(records);
+    if (!best) continue;
+    const current = currentRankRecord(latest, itemKey);
+    const effectiveCurrentRank = current?.rank || RANK_SCAN_LIMIT + 1;
+    const drop = effectiveCurrentRank - best.rank;
+
+    if (drop >= threshold) {
+      events.push(keywordEventRow(product, keyword, owner, current || best, {
         type: "지정 하락폭 이상",
         threshold,
-        fromRank: best.fromRank,
-        toRank: best.toRank,
-        fromAt: best.fromAt,
-        toAt: best.toAt,
-        drop: best.drop,
-        detail: `${formatReportDate(best.fromAt)} ${best.fromRank}위 -> ${formatReportDate(best.toAt)} ${best.toRank}위, ${best.drop}위 하락`
+        fromRank: best.rank,
+        toRank: current?.rank || null,
+        fromAt: best.checkedAt,
+        toAt: latest.checkedAt,
+        drop,
+        detail: `최근 7일 최고 ${formatReportDate(best.checkedAt)} ${best.rank}위 -> ${latestCollectionLabel(latest)} ${rankLabel(current?.rank || null)}, ${drop}위 하락`
       }));
     }
   }
@@ -3094,12 +3159,16 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
   addApiUsage(db, apiCalls, now);
   pruneOldSnapshots(db, now);
 
-  if (db.snapshots.length > 10000) db.snapshots = db.snapshots.slice(-10000);
+  if (MAX_SNAPSHOT_ROWS > 0 && db.snapshots.length > MAX_SNAPSHOT_ROWS) {
+    db.snapshots = db.snapshots.slice(-MAX_SNAPSHOT_ROWS);
+  }
 }
 
 function pruneOldSnapshots(db, now = Date.now()) {
-  const since = now - 7 * 86400000;
-  db.snapshots = (db.snapshots || []).filter((snapshot) => Number(snapshot.checkedAt || 0) >= since);
+  const snapshots = (db.snapshots || []).filter((snapshot) => Number(snapshot.checkedAt || 0));
+  const dateKeys = [...new Set(snapshots.map(snapshotDateKey).filter(Boolean))].sort();
+  const keepDateKeys = new Set(dateKeys.slice(-7));
+  db.snapshots = snapshots.filter((snapshot) => keepDateKeys.has(snapshotDateKey(snapshot)));
 }
 
 function startScheduleWorker() {
