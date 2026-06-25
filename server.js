@@ -37,8 +37,8 @@ const REPORT_RECIPIENTS = splitRecipients(process.env.REPORT_RECIPIENTS || "");
 const REPORT_FROM = process.env.REPORT_FROM || process.env.EMAIL_FROM || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ADMIN_APP_URL = trimTrailingSlash(process.env.ADMIN_APP_URL || "https://soondaeng-admin.onrender.com");
-const SUPABASE_TIMEOUT_MS = clamp(Number(process.env.SUPABASE_TIMEOUT_MS || 15000), 3000, 60000);
-const SUPABASE_RETRY_COUNT = clamp(Number(process.env.SUPABASE_RETRY_COUNT || 3), 1, 5);
+const SUPABASE_TIMEOUT_MS = clamp(Number(process.env.SUPABASE_TIMEOUT_MS || 60000), 3000, 60000);
+const SUPABASE_RETRY_COUNT = clamp(Number(process.env.SUPABASE_RETRY_COUNT || 5), 1, 5);
 let scheduledTrackingRunning = false;
 
 const mimeTypes = {
