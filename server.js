@@ -31,7 +31,7 @@ const RANK_SCAN_LIMIT = 50;
 const MAX_SNAPSHOT_ROWS = clamp(Number(process.env.MAX_SNAPSHOT_ROWS || 0), 0, 5000000);
 const SCHEDULE_TIMEZONE = process.env.SCHEDULE_TIMEZONE || "Asia/Seoul";
 const SCHEDULE_TIMES = parseScheduleTimes(process.env.SCHEDULE_TIMES || "08:00");
-const SCHEDULE_CATCHUP_MINUTES = clamp(Number(process.env.SCHEDULE_CATCHUP_MINUTES || 180), 0, 720);
+const SCHEDULE_CATCHUP_MINUTES = clamp(Number(process.env.SCHEDULE_CATCHUP_MINUTES || 720), 0, 1440);
 const SCHEDULE_RETRY_AFTER_MINUTES = clamp(Number(process.env.SCHEDULE_RETRY_AFTER_MINUTES || 30), 5, 240);
 const REPORT_RECIPIENTS = splitRecipients(process.env.REPORT_RECIPIENTS || "");
 const REPORT_FROM = process.env.REPORT_FROM || process.env.EMAIL_FROM || "";
@@ -2424,14 +2424,17 @@ async function runCronTracking(req, res, requestUrl) {
   }
 
   const now = getTimeInZone(SCHEDULE_TIMEZONE);
-  const dueSlot = getDueScheduleSlot(now);
+  const forced = isTruthy(requestUrl.searchParams.get("force"));
+  const dueSlot = forced ? getForcedScheduleSlot(now, requestUrl.searchParams.get("time")) : getDueScheduleSlot(now);
   if (!dueSlot) {
     sendJson(res, 200, {
       ok: true,
       skipped: true,
       source: "external-cron",
-      reason: "no_due_schedule",
-      message: `현재 ${SCHEDULE_TIMEZONE} 기준 실행할 예약 시간이 없습니다.`,
+      reason: forced ? "no_schedule_time" : "no_due_schedule",
+      message: forced
+        ? "강제 실행할 예약 시간이 설정되어 있지 않습니다."
+        : `현재 ${SCHEDULE_TIMEZONE} 기준 실행할 예약 시간이 없습니다.`,
       scheduleTimes: SCHEDULE_TIMES.map((item) => item.label),
       catchupMinutes: SCHEDULE_CATCHUP_MINUTES,
       retryAfterMinutes: SCHEDULE_RETRY_AFTER_MINUTES
@@ -2461,6 +2464,7 @@ async function runCronTracking(req, res, requestUrl) {
   sendJson(res, 202, {
     ok: true,
     source: "external-cron",
+    forced,
     queued: true,
     slotKey: dueSlot.slotKey,
     message: "예약 수집 작업을 접수했습니다. 수집과 메일 발송은 서버에서 계속 진행됩니다."
@@ -3251,9 +3255,27 @@ async function runScheduledTracking(slotKey, source = "auto") {
       report: reportResult,
       completedAt: latest.meta.scheduler.lastCompletedAt
     };
+  } catch (error) {
+    await recordSchedulerFailure(slotKey, error).catch((logError) => {
+      console.error(`[schedule] failed to record failure ${slotKey}`, logError);
+    });
+    throw error;
   } finally {
     scheduledTrackingRunning = false;
   }
+}
+
+async function recordSchedulerFailure(slotKey, error) {
+  const latest = await readDb();
+  addSchedulerLog(latest, {
+    slotKey,
+    status: "failed",
+    productCount: 0,
+    keywordCount: 0,
+    errorCount: 1,
+    error: String(error?.publicMessage || error?.message || error || "unknown").slice(0, 500)
+  });
+  await writeDb(latest);
 }
 
 async function claimScheduledRun(slotKey) {
@@ -3384,6 +3406,21 @@ function getDueScheduleSlot(now) {
     .sort((a, b) => a.elapsedMinutes - b.elapsedMinutes);
 
   return candidates[0] || null;
+}
+
+function getForcedScheduleSlot(now, requestedTime = "") {
+  if (!SCHEDULE_TIMES.length) return null;
+  const requested = parseScheduleTimes(requestedTime)[0]?.label || "";
+  const slot = requested
+    ? SCHEDULE_TIMES.find((item) => item.label === requested)
+    : SCHEDULE_TIMES[0];
+  if (!slot) return null;
+  return {
+    slot,
+    elapsedMinutes: null,
+    slotKey: `${now.date}:${slot.label}`,
+    forced: true
+  };
 }
 
 function getTimeInZone(timeZone) {
@@ -3986,6 +4023,11 @@ function wordOverlap(a, b) {
 
 async function serveStatic(req, res, requestUrl) {
   const rawPath = decodeURIComponent(requestUrl.pathname);
+  if (rawPath === "/healthz") {
+    sendJson(res, 200, { ok: true, service: "soondaeng-live" });
+    return;
+  }
+
   if (rawPath === "/favicon.ico") {
     res.writeHead(204, { "Cache-Control": "public, max-age=86400" });
     res.end();
@@ -4365,5 +4407,9 @@ function clamp(value, min, max) {
 
 function trimTrailingSlash(value) {
   return String(value || "").replace(/\/+$/, "");
+}
+
+function isTruthy(value) {
+  return ["1", "true", "yes", "y", "on"].includes(String(value || "").trim().toLowerCase());
 }
 
