@@ -255,7 +255,13 @@ async function logout() {
 }
 
 async function loadAll() {
-  await Promise.all([loadProducts(), loadReport(), loadNotices()]);
+  await Promise.all([
+    loadProducts().catch((error) => toast(error.message)),
+    loadNotices().catch(() => {}),
+    loadReport({ timeoutMs: 8000, retries: 0 }).catch(() => {
+      state.report = null;
+    })
+  ]);
 }
 
 async function loadProducts() {
@@ -264,8 +270,8 @@ async function loadProducts() {
   if (result.productLimit) state.config.productLimit = result.productLimit;
 }
 
-async function loadReport() {
-  state.report = await api("/api/report");
+async function loadReport(options = {}) {
+  state.report = await api("/api/report", options);
 }
 
 async function loadNotices() {

@@ -17,6 +17,7 @@ const DB_FILE = process.env.DATA_FILE || path.join(DATA_DIR, "db.json");
 const SUPABASE_URL = trimTrailingSlash(process.env.SUPABASE_URL || "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_STATE_TABLE = process.env.SUPABASE_STATE_TABLE || "soondaeng_state";
+const SUPABASE_SNAPSHOT_TABLE = process.env.SUPABASE_SNAPSHOT_TABLE || "soondaeng_snapshots";
 const NAVER_CLIENT_ID = process.env.NAVER_CLIENT_ID || "";
 const NAVER_CLIENT_SECRET = process.env.NAVER_CLIENT_SECRET || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
@@ -39,7 +40,9 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ADMIN_APP_URL = trimTrailingSlash(process.env.ADMIN_APP_URL || "https://soondaeng-admin.onrender.com");
 const SUPABASE_TIMEOUT_MS = clamp(Number(process.env.SUPABASE_TIMEOUT_MS || 60000), 3000, 60000);
 const SUPABASE_RETRY_COUNT = clamp(Number(process.env.SUPABASE_RETRY_COUNT || 5), 1, 5);
+const SCHEDULE_FAILURE_COOLDOWN_MS = clamp(Number(process.env.SCHEDULE_FAILURE_COOLDOWN_MS || 600000), 60000, 3600000);
 let scheduledTrackingRunning = false;
+let nextScheduleCheckAt = 0;
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -114,7 +117,7 @@ async function ensureDb() {
 
 async function readDb() {
   if (useSupabase()) {
-    const data = await readSupabaseState();
+    const data = await readSupabaseStateLight();
     return normalizeDb(data);
   }
 
@@ -122,6 +125,22 @@ async function readDb() {
   const raw = await readFile(DB_FILE, "utf8");
   const db = JSON.parse(raw);
   return normalizeDb(db);
+}
+
+async function readDbLight() {
+  if (useSupabase()) {
+    const data = await readSupabaseStateLight();
+    return normalizeDb(data);
+  }
+
+  return readDb();
+}
+
+async function readDbWithSnapshots(options = {}) {
+  const db = await readDb();
+  if (!useSupabase()) return db;
+  db.snapshots = await readSupabaseSnapshotRows(options);
+  return db;
 }
 
 async function writeDb(db) {
@@ -158,7 +177,7 @@ function useSupabase() {
 }
 
 async function ensureSupabaseState() {
-  const existing = await readSupabaseState({ allowMissing: true });
+  const existing = await readSupabaseStateExists();
   if (existing) return;
 
   const response = await supabaseFetch(`/${SUPABASE_STATE_TABLE}`, {
@@ -176,6 +195,21 @@ async function ensureSupabaseState() {
   }
 }
 
+async function readSupabaseStateExists() {
+  const response = await supabaseFetch(`/${SUPABASE_STATE_TABLE}?id=eq.main&select=id&limit=1`, {
+    method: "GET",
+    retries: 1
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) return false;
+    await throwSupabaseError(response, "Supabase 상태 저장소를 확인하지 못했습니다.");
+  }
+
+  const rows = await response.json();
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 async function readSupabaseState(options = {}) {
   const response = await supabaseFetch(`/${SUPABASE_STATE_TABLE}?id=eq.main&select=data`, {
     method: "GET"
@@ -191,18 +225,267 @@ async function readSupabaseState(options = {}) {
   return rows[0].data || null;
 }
 
+async function readSupabaseStateLight() {
+  const select = encodeURIComponent("users:data->users,sessions:data->sessions,products:data->products,meta:data->meta");
+  const response = await supabaseFetch(`/${SUPABASE_STATE_TABLE}?id=eq.main&select=${select}`, {
+    method: "GET"
+  });
+
+  if (!response.ok) {
+    await throwSupabaseError(response, "Supabase 상태 저장소를 부분 조회하지 못했습니다.");
+  }
+
+  const rows = await response.json();
+  if (!Array.isArray(rows) || !rows.length) return initialDb();
+  const row = rows[0] || {};
+  return {
+    users: row.users || [],
+    sessions: row.sessions || {},
+    products: row.products || [],
+    snapshots: [],
+    meta: row.meta || {}
+  };
+}
+
 async function writeSupabaseState(db) {
+  const stateDb = {
+    ...db,
+    snapshots: []
+  };
   const response = await supabaseFetch(`/${SUPABASE_STATE_TABLE}?id=eq.main`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
     body: {
-      data: db,
+      data: stateDb,
       updated_at: new Date().toISOString()
     }
   });
 
   if (!response.ok) {
     await throwSupabaseError(response, "Supabase 상태 저장소를 저장하지 못했습니다.");
+  }
+}
+
+async function readSupabaseSnapshotRows(options = {}) {
+  const now = Number(options.now || Date.now());
+  const windowDays = Number(options.windowDays || 7);
+  const since = Number(options.since || now - windowDays * 86400000);
+  const select = encodeURIComponent([
+    "id",
+    "collection_id",
+    "user_id",
+    "product_id",
+    "keyword_id",
+    "term",
+    "status",
+    "checked_at",
+    "date_key",
+    "items",
+    "api_calls",
+    "error",
+    "source",
+    "slot_key",
+    "graph_eligible",
+    "deleted_user_id",
+    "deleted_user_email",
+    "deleted_user_phone",
+    "deleted_user_store_name"
+  ].join(","));
+
+  const params = [
+    `select=${select}`,
+    `checked_at=gte.${Math.floor(since)}`,
+    `checked_at=lte.${Math.floor(now)}`,
+    "order=checked_at.asc"
+  ];
+
+  if (options.userId) params.push(`user_id=eq.${encodePostgrestValue(options.userId)}`);
+  if (options.productId) params.push(`product_id=eq.${encodePostgrestValue(options.productId)}`);
+  if (options.keywordId) params.push(`keyword_id=eq.${encodePostgrestValue(options.keywordId)}`);
+
+  const rows = await fetchAllSupabaseRows(`/${SUPABASE_SNAPSHOT_TABLE}?${params.join("&")}`, 1000);
+  return rows.flatMap(expandSupabaseSnapshotCollection);
+}
+
+async function fetchAllSupabaseRows(pathname, pageSize = 1000) {
+  const rows = [];
+  for (let start = 0; ; start += pageSize) {
+    const response = await supabaseFetch(pathname, {
+      method: "GET",
+      headers: {
+        "Range-Unit": "items",
+        Range: `${start}-${start + pageSize - 1}`
+      }
+    });
+
+    if (!response.ok) {
+      await throwSupabaseError(response, "Supabase 순위기록 테이블을 읽지 못했습니다.");
+    }
+
+    const page = await response.json();
+    if (!Array.isArray(page) || !page.length) break;
+    rows.push(...page);
+    if (page.length < pageSize) break;
+  }
+  return rows;
+}
+
+function expandSupabaseSnapshotCollection(row) {
+  const base = {
+    collectionId: row.collection_id || row.id || "",
+    userId: row.user_id || "",
+    productId: row.product_id || "",
+    keywordId: row.keyword_id || "",
+    term: row.term || "",
+    status: row.status || "completed",
+    checkedAt: Number(row.checked_at || 0),
+    dateKey: row.date_key || getDateKey(row.checked_at || Date.now(), SCHEDULE_TIMEZONE),
+    error: row.error || "",
+    source: row.source || "",
+    slotKey: row.slot_key || "",
+    graphEligible: row.graph_eligible === true,
+    deletedUserId: row.deleted_user_id || "",
+    deletedUserEmail: row.deleted_user_email || "",
+    deletedUserPhone: row.deleted_user_phone || "",
+    deletedUserStoreName: row.deleted_user_store_name || ""
+  };
+
+  const items = Array.isArray(row.items) ? row.items : [];
+  if (!items.length) {
+    return [{
+      id: row.id || uid(),
+      ...base,
+      rank: null,
+      itemKey: "",
+      productName: "",
+      productUrl: "",
+      storeName: "",
+      image: "",
+      price: "",
+      productNaverId: "",
+      apiCalls: Number(row.api_calls || 0)
+    }];
+  }
+
+  return items.map((item, index) => ({
+    id: item.id || `${row.id || base.collectionId}:${index}`,
+    ...base,
+    rank: Number(item.rank || 0) || null,
+    status: "completed",
+    itemKey: item.itemKey || item.item_key || item.productId || item.product_naver_id || item.productUrl || item.product_url || "",
+    productName: item.productName || item.product_name || "",
+    productUrl: item.productUrl || item.product_url || "",
+    storeName: item.storeName || item.store_name || "",
+    image: item.image || "",
+    price: item.price || "",
+    productNaverId: item.productNaverId || item.product_naver_id || "",
+    apiCalls: index === 0 ? Number(row.api_calls || 0) : 0
+  }));
+}
+
+function encodePostgrestValue(value) {
+  return encodeURIComponent(String(value || "")).replace(/\*/g, "%2A");
+}
+
+async function persistSnapshotRows(rows, now = Date.now()) {
+  if (!Array.isArray(rows) || !rows.length || !useSupabase()) return;
+  const collectionRows = buildSupabaseSnapshotCollectionRows(rows);
+  for (let index = 0; index < collectionRows.length; index += 500) {
+    const chunk = collectionRows.slice(index, index + 500);
+    const response = await supabaseFetch(`/${SUPABASE_SNAPSHOT_TABLE}?on_conflict=id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+      body: chunk
+    });
+
+    if (!response.ok) {
+      await throwSupabaseError(response, "Supabase 순위기록 테이블에 저장하지 못했습니다.");
+    }
+  }
+
+  await pruneSupabaseSnapshotRows(now);
+}
+
+function buildSupabaseSnapshotCollectionRows(rows) {
+  const groups = new Map();
+
+  for (const snapshot of rows || []) {
+    const checkedAt = Number(snapshot.checkedAt || Date.now());
+    const dateKey = snapshot.dateKey || getDateKey(checkedAt, SCHEDULE_TIMEZONE);
+    const collectionId = snapshot.collectionId || `${snapshot.userId || ""}:${snapshot.productId || ""}:${snapshot.keywordId || ""}:${dateKey}:${checkedAt}`;
+    if (!groups.has(collectionId)) {
+      groups.set(collectionId, {
+        id: collectionId,
+        collection_id: collectionId,
+        user_id: snapshot.userId || "",
+        product_id: snapshot.productId || "",
+        keyword_id: snapshot.keywordId || "",
+        term: snapshot.term || "",
+        status: snapshot.status || "completed",
+        checked_at: checkedAt,
+        date_key: dateKey,
+        items: [],
+        api_calls: 0,
+        error: snapshot.error || "",
+        source: snapshot.source || "",
+        slot_key: snapshot.slotKey || "",
+        graph_eligible: snapshot.graphEligible === true,
+        deleted_user_id: snapshot.deletedUserId || "",
+        deleted_user_email: snapshot.deletedUserEmail || "",
+        deleted_user_phone: snapshot.deletedUserPhone || "",
+        deleted_user_store_name: snapshot.deletedUserStoreName || ""
+      });
+    }
+
+    const group = groups.get(collectionId);
+    group.status = group.status === "error" ? group.status : snapshot.status || group.status;
+    group.api_calls += Number(snapshot.apiCalls || 0);
+    if (snapshot.error) group.error = snapshot.error;
+
+    if (snapshot.status === "completed" && (snapshot.itemKey || snapshot.productName || snapshot.productUrl)) {
+      group.items.push({
+        id: snapshot.id || uid(),
+        rank: Number(snapshot.rank || 0) || null,
+        itemKey: snapshot.itemKey || "",
+        productName: snapshot.productName || "",
+        productUrl: snapshot.productUrl || "",
+        storeName: snapshot.storeName || "",
+        image: snapshot.image || "",
+        price: snapshot.price || "",
+        productNaverId: snapshot.productNaverId || ""
+      });
+    }
+  }
+
+  return [...groups.values()].map((row) => ({
+    ...row,
+    items: row.items.sort((a, b) => Number(a.rank || 9999) - Number(b.rank || 9999))
+  }));
+}
+
+async function pruneSupabaseSnapshotRows(now = Date.now()) {
+  const cutoffKey = getDateKey(now - 6 * 86400000, SCHEDULE_TIMEZONE);
+  const response = await supabaseFetch(`/${SUPABASE_SNAPSHOT_TABLE}?date_key=lt.${encodePostgrestValue(cutoffKey)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+    retries: 1
+  });
+
+  if (!response.ok && response.status !== 404) {
+    await throwSupabaseError(response, "Supabase 오래된 순위기록을 정리하지 못했습니다.");
+  }
+}
+
+async function deleteSupabaseSnapshotsForProduct(userId, productId) {
+  if (!useSupabase()) return;
+  const response = await supabaseFetch(`/${SUPABASE_SNAPSHOT_TABLE}?user_id=eq.${encodePostgrestValue(userId)}&product_id=eq.${encodePostgrestValue(productId)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+    retries: 1
+  });
+
+  if (!response.ok && response.status !== 404) {
+    await throwSupabaseError(response, "Supabase 상품 순위기록을 삭제하지 못했습니다.");
   }
 }
 
@@ -260,12 +543,11 @@ async function handleApi(req, res, requestUrl) {
   const segments = requestUrl.pathname.split("/").filter(Boolean);
 
   if (method === "GET" && requestUrl.pathname === "/api/config") {
-    const optionalUser = await getOptionalUser(req);
     sendJson(res, 200, {
       hasNaverKeys: Boolean(NAVER_CLIENT_ID && NAVER_CLIENT_SECRET),
       hasSupabase: useSupabase(),
       scanLimit: RANK_SCAN_LIMIT,
-      productLimit: optionalUser ? getUserProductLimit(optionalUser) : FREE_PRODUCT_LIMIT,
+      productLimit: FREE_PRODUCT_LIMIT,
       scheduleTimes: SCHEDULE_TIMES.map((item) => item.label),
       scheduleTimezone: SCHEDULE_TIMEZONE,
       scheduleCatchupMinutes: SCHEDULE_CATCHUP_MINUTES,
@@ -303,7 +585,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (method === "GET" && requestUrl.pathname === "/api/notices") {
     const optionalUser = await getOptionalUser(req);
-    const db = await readDb();
+    const db = await readDbLight();
     sendJson(res, 200, buildPublicNotices(db, optionalUser));
     return;
   }
@@ -324,7 +606,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (method === "POST" && segments[0] === "api" && segments[1] === "notices" && segments[2] && segments[3] === "comments") {
     const body = await readJson(req);
-    const db = auth.db;
+    const db = await readDb();
     const notice = createNoticeComment(db, segments[2], auth.user, body);
     await writeDb(db);
     sendJson(res, 201, { notice });
@@ -332,7 +614,7 @@ async function handleApi(req, res, requestUrl) {
   }
 
   if (((method === "POST" && segments[5] === "delete") || method === "DELETE") && segments[0] === "api" && segments[1] === "notices" && segments[2] && segments[3] === "comments" && segments[4]) {
-    const db = auth.db;
+    const db = await readDb();
     const result = deleteNoticeComment(db, segments[2], segments[4], { user: auth.user });
     await writeDb(db);
     sendJson(res, 200, result);
@@ -340,7 +622,7 @@ async function handleApi(req, res, requestUrl) {
   }
 
   if (method === "GET" && requestUrl.pathname === "/api/products") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots({ userId: auth.user.id });
     const products = db.products
       .filter((product) => product.userId === auth.user.id)
       .map((product) => publicProduct(product, db, auth.user.id));
@@ -349,19 +631,19 @@ async function handleApi(req, res, requestUrl) {
   }
 
   if (method === "GET" && requestUrl.pathname === "/api/activity") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots({ userId: auth.user.id });
     sendJson(res, 200, buildUserActivity(db, auth.user.id));
     return;
   }
 
   if (method === "GET" && requestUrl.pathname === "/api/report") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots({ userId: auth.user.id });
     sendJson(res, 200, buildRankReport(db, { userId: auth.user.id }));
     return;
   }
 
   if (method === "GET" && requestUrl.pathname === "/api/report/export") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots({ userId: auth.user.id });
     const report = buildRankReport(db, { userId: auth.user.id });
     sendWorkbook(res, buildRankReportWorkbook(report), reportFileName(report));
     return;
@@ -373,7 +655,11 @@ async function handleApi(req, res, requestUrl) {
   }
 
   if (method === "GET" && requestUrl.pathname === "/api/history") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots({
+      userId: auth.user.id,
+      productId: requestUrl.searchParams.get("productId") || "",
+      keywordId: requestUrl.searchParams.get("keywordId") || ""
+    });
     sendJson(res, 200, buildUserHistory(db, auth.user.id, requestUrl));
     return;
   }
@@ -494,7 +780,7 @@ async function loginUser(req, res, body) {
     return;
   }
 
-  const db = await readDb();
+  const db = await readDbLight();
   const user = db.users.find((item) => normalizePhone(item.phone) === phone);
 
   if (!user || !verifyPassword(password, user.passwordHash)) {
@@ -517,19 +803,12 @@ async function loginUser(req, res, body) {
     return;
   }
 
-  const token = createSession(db, user.id, Date.now());
-  await writeDb(db);
+  const token = createSessionToken(user.id, Date.now());
   setSessionCookie(req, res, token);
   sendJson(res, 200, { user: publicUser(user) });
 }
 
 async function logoutUser(req, res) {
-  const token = getSessionToken(req);
-  if (token) {
-    const db = await readDb();
-    delete db.sessions[token];
-    await writeDb(db);
-  }
   clearSessionCookie(req, res);
   sendJson(res, 200, { ok: true });
 }
@@ -590,12 +869,14 @@ async function updateUserProfile(req, res, currentUser, body) {
 }
 
 async function getOptionalUser(req) {
-  const token = getSessionToken(req);
-  if (!token) return null;
-  const db = await readDb();
-  const session = db.sessions[token];
-  if (!session || session.expiresAt < Date.now()) return null;
-  return db.users.find((item) => item.id === session.userId) || null;
+  const sessionAuth = parseSessionAuth(req);
+  if (!sessionAuth) return null;
+  const db = await readDbLight();
+  const userId = sessionAuth.userId || db.sessions?.[sessionAuth.legacyToken]?.userId || "";
+  if (!userId) return null;
+  const legacySession = sessionAuth.legacyToken ? db.sessions?.[sessionAuth.legacyToken] : null;
+  if (legacySession && legacySession.expiresAt < Date.now()) return null;
+  return db.users.find((item) => item.id === userId) || null;
 }
 
 async function handleAdminApi(req, res, requestUrl) {
@@ -613,33 +894,33 @@ async function handleAdminApi(req, res, requestUrl) {
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/api/admin/overview") {
-    const limit = clamp(Number(requestUrl.searchParams.get("limit") || 1000), 100, 5000);
-    const db = await readDb();
+    const limit = clamp(Number(requestUrl.searchParams.get("limit") || 200), 50, 1000);
+    const db = await readDbLight();
     sendJson(res, 200, buildAdminOverview(db, limit));
     return;
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/api/admin/backup") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots();
     sendJson(res, 200, buildAdminBackup(db));
     return;
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/api/admin/reports/latest") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots();
     sendJson(res, 200, buildRankReport(db));
     return;
   }
 
   if (req.method === "GET" && requestUrl.pathname === "/api/admin/reports/export") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots();
     const report = buildRankReport(db);
     sendWorkbook(res, buildRankReportWorkbook(report), reportFileName(report));
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/admin/reports/send") {
-    const db = await readDb();
+    const db = await readDbWithSnapshots();
     const reportResult = await createAndSendRankReport(db, `admin:${Date.now()}`, "admin");
     await writeDb(db);
     sendJson(res, 200, { ok: true, report: reportResult });
@@ -1135,6 +1416,7 @@ function buildAdminOverview(db, snapshotLimit) {
   const snapshots = db.snapshots || [];
   const userMap = new Map(users.map((user) => [user.id, user]));
   const productMap = new Map(products.map((product) => [product.id, product]));
+  const productListLimit = clamp(Number(snapshotLimit || 300), 50, 1000);
   const productsByUser = new Map();
   let keywordCount = 0;
   let rankedKeywordCount = 0;
@@ -1216,6 +1498,8 @@ function buildAdminOverview(db, snapshotLimit) {
       missingCount,
       errorCount,
       snapshotCount: snapshots.length,
+      productListCount: Math.min(products.length, productListLimit),
+      productListLimited: products.length > productListLimit,
       lastCheckedAt: lastCheckedAt || null,
       storage: useSupabase() ? "supabase" : "local",
       apiUsage: apiUsageSummary,
@@ -1237,7 +1521,10 @@ function buildAdminOverview(db, snapshotLimit) {
         Number(apiCallsByUser.get(user.id) || 0)
       );
     }).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)),
-    products: products.map((product) => {
+    products: [...products]
+      .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+      .slice(0, productListLimit)
+      .map((product) => {
       const owner = userMap.get(product.userId);
       const ownerEmail = owner?.email || product.deletedUserEmail || "";
       const ownerPhone = normalizePhone(owner?.phone || product.deletedUserPhone);
@@ -1267,7 +1554,7 @@ function buildAdminOverview(db, snapshotLimit) {
         createdAt: product.createdAt || null,
         keywordCount: keywords.length,
         resultCount: isKeywordTarget(product) ? Number(keywords[0]?.resultCount || (product.topItems || []).length || 0) : 0,
-        latestItems: isKeywordTarget(product) ? (product.topItems || []).slice(0, RANK_SCAN_LIMIT) : [],
+        latestItems: [],
         bestRank,
         lastCheckedAt: lastChecked || null,
         keywords: keywords.map((keyword) => ({
@@ -1279,39 +1566,15 @@ function buildAdminOverview(db, snapshotLimit) {
           prevRank: keyword.prevRank || null,
           bestRank: keyword.bestRank || null,
           status: keyword.status || "pending",
-          history: Array.isArray(keyword.history) ? keyword.history : [],
+          history: [],
           lastChecked: keyword.lastChecked || null,
           lastError: keyword.lastError || "",
           matchedBy: keyword.matchedBy || "",
           lastApiCalls: keyword.lastApiCalls || 0
         }))
       };
-    }).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)),
-    snapshots: [...snapshots]
-      .sort((a, b) => Number(b.checkedAt || 0) - Number(a.checkedAt || 0))
-      .slice(0, snapshotLimit)
-      .map((snapshot) => {
-        const product = productMap.get(snapshot.productId);
-        const user = userMap.get(snapshot.userId);
-        const userEmail = user?.email || snapshot.deletedUserEmail || product?.deletedUserEmail || "";
-        const userPhone = normalizePhone(user?.phone || snapshot.deletedUserPhone || product?.deletedUserPhone);
-        return {
-          id: snapshot.id,
-          userId: snapshot.userId,
-          userEmail,
-          userPhone,
-          productId: snapshot.productId,
-          productName: product?.name || "",
-          productUrl: product?.url || "",
-          keywordId: snapshot.keywordId,
-          term: snapshot.term || "",
-          rank: snapshot.rank || null,
-          status: snapshot.status || "pending",
-          checkedAt: snapshot.checkedAt || null,
-          apiCalls: snapshot.apiCalls || 0,
-          error: snapshot.error || ""
-        };
-      })
+    }),
+    snapshots: []
   };
 }
 
@@ -1891,8 +2154,9 @@ function reportFileName(report) {
 }
 
 async function createAndSendRankReport(db, slotKey, source) {
-  const report = buildRankReport(db);
-  const email = await sendMemberRankReportEmails(db).catch((error) => ({
+  const reportDb = useSupabase() ? await readDbWithSnapshots() : db;
+  const report = buildRankReport(reportDb);
+  const email = await sendMemberRankReportEmails(reportDb).catch((error) => ({
     status: "error",
     mode: "members",
     message: error.message || "이메일 발송 중 오류가 발생했습니다."
@@ -1929,7 +2193,7 @@ async function sendUserReportRoute(req, res, user) {
     return;
   }
 
-  const db = await readDb();
+  const db = await readDbWithSnapshots({ userId: user.id });
   const report = buildRankReport(db, { userId: user.id });
   if (!report.summary.keywordCount) {
     sendJson(res, 400, { error: "NO_KEYWORDS", message: "등록된 키워드가 없어 메일로 보낼 리포트가 없습니다." });
@@ -2472,48 +2736,50 @@ async function runCronTracking(req, res, requestUrl) {
 }
 
 async function requireAuth(req, res) {
-  const token = getSessionToken(req);
-  if (!token) {
+  const sessionAuth = parseSessionAuth(req);
+  if (!sessionAuth) {
     sendJson(res, 401, { error: "UNAUTHORIZED", message: "로그인이 필요합니다." });
     return null;
   }
 
-  const db = await readDb();
-  const session = db.sessions[token];
-  if (!session || session.expiresAt < Date.now()) {
-    delete db.sessions[token];
-    await writeDb(db);
+  const db = await readDbLight();
+  let userId = sessionAuth.userId || "";
+  if (!userId && sessionAuth.legacyToken) {
+    const session = db.sessions?.[sessionAuth.legacyToken];
+    if (!session || session.expiresAt < Date.now()) {
+      clearSessionCookie(req, res);
+      sendJson(res, 401, { error: "SESSION_EXPIRED", message: "세션이 만료되었습니다." });
+      return null;
+    }
+    userId = session.userId;
+  }
+
+  if (!userId) {
     clearSessionCookie(req, res);
     sendJson(res, 401, { error: "SESSION_EXPIRED", message: "세션이 만료되었습니다." });
     return null;
   }
 
-  const user = db.users.find((item) => item.id === session.userId);
+  const user = db.users.find((item) => item.id === userId);
   if (!user) {
-    delete db.sessions[token];
-    await writeDb(db);
     clearSessionCookie(req, res);
     sendJson(res, 401, { error: "UNAUTHORIZED", message: "사용자를 찾을 수 없습니다." });
     return null;
   }
 
   if (getUserRestrictions(user).suspended) {
-    delete db.sessions[token];
-    await writeDb(db);
     clearSessionCookie(req, res);
     sendJson(res, 403, { error: "ACCOUNT_SUSPENDED", message: getRestrictionMessage(user, "계정 사용이 일시 제한되었습니다.") });
     return null;
   }
 
   if (!isUserApproved(user)) {
-    delete db.sessions[token];
-    await writeDb(db);
     clearSessionCookie(req, res);
     sendJson(res, 403, { error: "APPROVAL_PENDING", message: "관리자 승인 후 사용할 수 있습니다." });
     return null;
   }
 
-  return { db, user, token };
+  return { db, user, token: sessionAuth.token };
 }
 
 async function previewProduct(req, res, user, body) {
@@ -2616,7 +2882,8 @@ async function createProduct(req, res, user, body) {
 
   const trackedProduct = await trackProduct(product, trackingContext("registration"));
   db.products.unshift(trackedProduct);
-  appendSnapshots(db, user.id, [trackedProduct], trackingContext("registration"));
+  const snapshotRows = appendSnapshots(db, user.id, [trackedProduct], trackingContext("registration"));
+  await persistSnapshotRows(snapshotRows);
   await writeDb(db);
   sendJson(res, 201, { product: publicProduct(trackedProduct, db, user.id) });
 }
@@ -2632,6 +2899,7 @@ async function deleteProduct(req, res, user, productId) {
     return;
   }
 
+  await deleteSupabaseSnapshotsForProduct(user.id, productId);
   await writeDb(db);
   sendJson(res, 200, { ok: true });
 }
@@ -2695,7 +2963,8 @@ async function bulkCreateProducts(req, res, user, body) {
   }
 
   db.products.unshift(...created);
-  appendSnapshots(db, user.id, created, trackingContext("bulk"));
+  const snapshotRows = appendSnapshots(db, user.id, created, trackingContext("bulk"));
+  await persistSnapshotRows(snapshotRows);
   await writeDb(db);
   sendJson(res, 201, {
     products: created.map((product) => publicProduct(product, db, user.id)),
@@ -2717,7 +2986,7 @@ async function trackAllProducts(req, res, user) {
   const tracked = await trackProductsBatched(products, context);
 
   await persistTrackedProducts(user.id, tracked, context);
-  const latestDb = await readDb();
+  const latestDb = await readDbWithSnapshots({ userId: user.id });
   const responseProducts = latestDb.products
     .filter((product) => product.userId === user.id)
     .map((product) => publicProduct(product, latestDb, user.id));
@@ -2739,7 +3008,7 @@ async function trackProductRoute(req, res, user, productId) {
 
   const tracked = await trackProduct(product, trackingContext("manual"));
   await persistTrackedProducts(user.id, [tracked], trackingContext("manual"));
-  const latestDb = await readDb();
+  const latestDb = await readDbWithSnapshots({ userId: user.id, productId });
   const latestProduct = latestDb.products.find((item) => item.userId === user.id && item.id === productId) || tracked;
   sendJson(res, 200, { product: publicProduct(latestProduct, latestDb, user.id) });
 }
@@ -2766,7 +3035,7 @@ async function trackKeywordRoute(req, res, user, productId, keywordId) {
   const trackedKeyword = await trackKeyword(product, keyword, trackingContext("manual"));
   product.keywords = product.keywords.map((item) => item.id === keywordId ? trackedKeyword : item);
   await persistTrackedProducts(user.id, [product], trackingContext("manual"));
-  const latestDb = await readDb();
+  const latestDb = await readDbWithSnapshots({ userId: user.id, productId, keywordId });
   const latestProduct = latestDb.products.find((item) => item.userId === user.id && item.id === productId) || product;
   sendJson(res, 200, { product: publicProduct(latestProduct, latestDb, user.id), keyword: publicKeyword(trackedKeyword) });
 }
@@ -3054,7 +3323,8 @@ async function persistTrackedProducts(userId, trackedProducts, context = trackin
     return product;
   });
 
-  appendSnapshots(db, userId, trackedProducts, context);
+  const snapshotRows = appendSnapshots(db, userId, trackedProducts, context);
+  await persistSnapshotRows(snapshotRows);
   await writeDb(db);
 }
 
@@ -3064,21 +3334,23 @@ async function persistTrackedProductsBulk(trackedProducts, context = trackingCon
 
   db.products = db.products.map((product) => trackedMap.has(product.id) ? trackedMap.get(product.id) : product);
 
-  appendSnapshotsForProducts(db, trackedProducts, context);
+  const snapshotRows = appendSnapshotsForProducts(db, trackedProducts, context);
+  await persistSnapshotRows(snapshotRows);
   await writeDb(db);
 }
 
 function appendSnapshots(db, userId, trackedProducts, context = trackingContext("manual")) {
-  appendSnapshotRows(db, trackedProducts, context, userId);
+  return appendSnapshotRows(db, trackedProducts, context, userId);
 }
 
 function appendSnapshotsForProducts(db, trackedProducts, context = trackingContext("manual")) {
-  appendSnapshotRows(db, trackedProducts, context);
+  return appendSnapshotRows(db, trackedProducts, context);
 }
 
 function appendSnapshotRows(db, trackedProducts, context = trackingContext("manual"), forcedUserId = "") {
   const now = Date.now();
   let apiCalls = 0;
+  const createdRows = [];
   (trackedProducts || []).forEach((product) => {
     if (isKeywordTarget(product)) {
       const keyword = (product.keywords || [])[0] || {};
@@ -3086,7 +3358,7 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
       const collectionId = uid();
       apiCalls += Number(keyword.lastApiCalls || 0);
       (product.topItems || []).slice(0, RANK_SCAN_LIMIT).forEach((item, itemIndex) => {
-        db.snapshots.push({
+        const row = {
           id: uid(),
           collectionId,
           userId: forcedUserId || product.userId,
@@ -3109,10 +3381,12 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
           source: context.source,
           slotKey: context.slotKey || "",
           graphEligible: Boolean(context.graphEligible)
-        });
+        };
+        db.snapshots.push(row);
+        createdRows.push(row);
       });
       if (keyword.status === "error") {
-        db.snapshots.push({
+        const row = {
           id: uid(),
           collectionId,
           userId: forcedUserId || product.userId,
@@ -3135,14 +3409,16 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
           source: context.source,
           slotKey: context.slotKey || "",
           graphEligible: Boolean(context.graphEligible)
-        });
+        };
+        db.snapshots.push(row);
+        createdRows.push(row);
       }
       return;
     }
 
     product.keywords.forEach((keyword) => {
       apiCalls += Number(keyword.lastApiCalls || 0);
-      db.snapshots.push({
+      const row = {
         id: uid(),
         userId: forcedUserId || product.userId,
         productId: product.id,
@@ -3156,7 +3432,9 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
           source: context.source,
           slotKey: context.slotKey || "",
           graphEligible: Boolean(context.graphEligible)
-      });
+      };
+      db.snapshots.push(row);
+      createdRows.push(row);
     });
   });
 
@@ -3166,6 +3444,8 @@ function appendSnapshotRows(db, trackedProducts, context = trackingContext("manu
   if (MAX_SNAPSHOT_ROWS > 0 && db.snapshots.length > MAX_SNAPSHOT_ROWS) {
     db.snapshots = db.snapshots.slice(-MAX_SNAPSHOT_ROWS);
   }
+
+  return createdRows;
 }
 
 function pruneOldSnapshots(db, now = Date.now()) {
@@ -3179,7 +3459,9 @@ function startScheduleWorker() {
   if (!SCHEDULE_TIMES.length) return;
 
   const tick = () => {
+    if (Date.now() < nextScheduleCheckAt) return;
     checkScheduledTracking().catch((error) => {
+      nextScheduleCheckAt = Date.now() + SCHEDULE_FAILURE_COOLDOWN_MS;
       console.error("Scheduled tracking failed", error);
     });
   };
@@ -4052,9 +4334,10 @@ async function serveStatic(req, res, requestUrl) {
     const info = await stat(filePath);
     if (!info.isFile()) throw new Error("Not a file");
     const ext = path.extname(filePath).toLowerCase();
+    const noStore = [".html", ".js", ".css"].includes(ext);
     res.writeHead(200, {
       "Content-Type": mimeTypes[ext] || "application/octet-stream",
-      "Cache-Control": ext === ".html" ? "no-store" : "public, max-age=3600"
+      "Cache-Control": noStore ? "no-store" : "public, max-age=3600"
     });
     createReadStream(filePath).pipe(res);
   } catch {
@@ -4079,9 +4362,50 @@ function createSession(db, userId, now) {
   return `${raw}.${signature}`;
 }
 
-function getSessionToken(req) {
+function createSessionToken(userId, now) {
+  const payload = Buffer.from(JSON.stringify({
+    userId,
+    createdAt: now,
+    expiresAt: now + 1000 * 60 * 60 * 24 * 30
+  }), "utf8").toString("base64url");
+  const raw = `v2.${payload}`;
+  return `${raw}.${signToken(raw)}`;
+}
+
+function parseSessionAuth(req) {
+  const value = getSessionCookie(req);
+  if (!value || !value.includes(".")) return null;
+
+  const parts = value.split(".");
+  if (parts[0] === "v2" && parts.length === 3) {
+    const raw = `${parts[0]}.${parts[1]}`;
+    const signature = parts[2];
+    if (!signature || signToken(raw) !== signature) return null;
+    try {
+      const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+      if (!payload.userId || Number(payload.expiresAt || 0) < Date.now()) return null;
+      return {
+        token: value,
+        userId: payload.userId,
+        expiresAt: Number(payload.expiresAt || 0),
+        stateless: true
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  const legacyToken = getLegacySessionToken(value);
+  if (!legacyToken) return null;
+  return { token: value, legacyToken, stateless: false };
+}
+
+function getSessionCookie(req) {
   const cookies = parseCookies(req.headers.cookie || "");
-  const value = cookies.sr_session;
+  return cookies.sr_session || "";
+}
+
+function getLegacySessionToken(value) {
   if (!value || !value.includes(".")) return "";
   const [raw, signature] = value.split(".");
   if (!raw || !signature || signToken(raw) !== signature) return "";
